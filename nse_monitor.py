@@ -694,6 +694,24 @@ if __name__ == "__main__":
     print("   Interval: Every 30 seconds\n")
 
     setup()
+
+    # Verify Telegram connectivity before starting
+    print("   Testing Telegram connection...")
+    test_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    test_ids = load_subscribers()
+    for cid in test_ids:
+        try:
+            r = requests.post(test_url, json={
+                "chat_id": cid,
+                "text": f"\u2705 Monitor started successfully\n\u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}\n\U0001f4e1 Telegram connection verified"
+            }, timeout=10)
+            if r.status_code == 200:
+                print(f"   \u2705 Telegram test OK (chat {cid})")
+            else:
+                print(f"   \u26a0\ufe0f Telegram test FAILED for {cid}: {r.text}")
+        except Exception as e:
+            print(f"   \u26a0\ufe0f Telegram test FAILED: {e}")
+
     print("   Initializing NSE session...")
     nse_session = create_nse_session()
     send_startup_message()
