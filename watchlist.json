@@ -1,0 +1,7 @@
+{
+    "My Stocks": ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"],
+    "PSU Banks": ["SBIN", "BANKBARODA", "PNB", "CANBK", "UNIONBANK", "IOB", "INDIANB"],
+    "IT Sector": ["TCS", "INFY", "WIPRO", "HCLTECH", "TECHM", "LTIM", "PERSISTENT"],
+    "Pharma": ["SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB", "BIOCON"],
+    "Auto": ["TATAMOTORS", "M&M", "MARUTI", "BAJAJ-AUTO", "HEROMOTOCO"]
+}

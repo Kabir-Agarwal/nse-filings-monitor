@@ -1,0 +1,37 @@
+# Credentials & secrets
+credentials.json
+credentials.json.json
+subscribers.txt
+.env
+.env.local
+
+# Data files (generated at runtime)
+NSE_Filings_Log*.xlsx
+~$NSE_Filings_Log*.xlsx
+seen_filings.json
+crashes.log
+
+# Downloaded filings
+Filings/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Claude Code
+.claude/
