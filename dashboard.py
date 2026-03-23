@@ -2,13 +2,16 @@ import streamlit as st
 import pandas as pd
 import json
 import os
-import shutil
-import tempfile
 from datetime import datetime
 from pathlib import Path
+from supabase import create_client
+
+# ── Supabase connection ──
+SUPABASE_URL = os.environ.get("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", st.secrets.get("SUPABASE_KEY", ""))
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BASE_DIR = Path(__file__).parent
-EXCEL_FILE = BASE_DIR / "NSE_Filings_Log.xlsx"
 WATCHLIST_FILE = BASE_DIR / "watchlist.json"
 
 DISPLAY_COLUMNS = [
@@ -265,29 +268,34 @@ def get_market_status():
 
 
 def load_data():
-    from zipfile import BadZipFile
-    primary = str(EXCEL_FILE)
-    backup = str(EXCEL_FILE).replace(".xlsx", "_backup.xlsx")
     try:
-        tmp = tempfile.mktemp(suffix=".xlsx")
-        shutil.copy2(primary, tmp)
-        df = pd.read_excel(tmp)
-        os.remove(tmp)
-    except BadZipFile:
-        try:
-            tmp = tempfile.mktemp(suffix=".xlsx")
-            shutil.copy2(backup, tmp)
-            df = pd.read_excel(tmp)
-            os.remove(tmp)
-        except Exception:
+        response = supabase.table("nse_filings").select("*").order("created_at", desc=True).limit(5000).execute()
+        if not response.data:
             return pd.DataFrame()
-    except Exception:
+        df = pd.DataFrame(response.data)
+        # Rename Supabase columns to match dashboard display names
+        col_map = {
+            "date": "Date",
+            "time": "Time",
+            "symbol": "Symbol",
+            "company": "Company",
+            "filing_type": "Filing Type",
+            "category": "Category",
+            "summary": "Summary",
+            "verdict": "Verdict",
+            "confidence": "Confidence",
+            "reason": "Reason",
+            "risk": "Risk",
+            "cmp_at_filing": "CMP at Filing",
+            "day_change_pct": "Day Change %",
+        }
+        df = df.rename(columns=col_map)
+        if "Category" in df.columns:
+            df["Category"] = df["Category"].astype(str).str.strip().str.upper()
+        return df
+    except Exception as e:
+        st.error(f"Supabase error: {e}")
         return pd.DataFrame()
-    if "Risk" in df.columns:
-        df["Risk"] = df["Risk"].astype(str).str.strip().str.upper()
-    if "Category" in df.columns:
-        df["Category"] = df["Category"].astype(str).str.strip().str.upper()
-    return df
 
 
 def load_watchlist():
@@ -356,7 +364,7 @@ st.sidebar.markdown(
     f'Session: {datetime.now().strftime("%d %b %Y")}<br>'
     f'Engine: Gemini 2.0 Flash<br>'
     f'Feed: NSE Corp Announcements<br>'
-    f'Network: 0.0.0.0:8501</p>',
+    f'DB: Supabase Cloud</p>',
     unsafe_allow_html=True,
 )
 
@@ -561,7 +569,7 @@ def filings_table():
     # ── Last refresh time ──
     st.markdown(
         f'<p style="color:#1a2a3a;font-size:0.6rem;font-family:JetBrains Mono,monospace;text-align:center;margin-top:8px;">'
-        f'Last refresh: {datetime.now().strftime("%H:%M:%S")} | Network accessible at 0.0.0.0:8501</p>',
+        f'Last refresh: {datetime.now().strftime("%H:%M:%S")} | Powered by Supabase</p>',
         unsafe_allow_html=True,
     )
 

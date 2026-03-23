@@ -12,12 +12,11 @@ import time
 import os
 import shutil
 import schedule
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from google import genai
 import pdfplumber
+from supabase import create_client
 
 # ============================================================
 # CONFIGURATION
@@ -30,10 +29,11 @@ GEMINI_KEYS = [
 GEMINI_KEYS = [k for k in GEMINI_KEYS if k]  # Remove empty keys
 gemini_key_index = 0
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 BASE_FOLDER = r"C:\Users\LENOVO\Desktop\linkdin projects"
 SUBSCRIBERS_FILE = os.path.join(BASE_FOLDER, "subscribers.txt")
 FILINGS_FOLDER = os.path.join(BASE_FOLDER, "Filings")
-EXCEL_FILE = os.path.join(BASE_FOLDER, "NSE_Filings_Log.xlsx")
 SEEN_FILINGS_FILE = os.path.join(BASE_FOLDER, "seen_filings.json")
 WATCHLIST_FILE = os.path.join(BASE_FOLDER, "watchlist.json")
 
@@ -52,18 +52,9 @@ def rotate_gemini_key():
     print(f"   Rotated to Gemini key #{gemini_key_index + 1}")
 
 # ============================================================
-# STYLES
+# SUPABASE SETUP
 # ============================================================
-HEADER_FONT = Font(name="Calibri", bold=True, color="FFFFFF")
-HEADER_FILL = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-HIGH_FILL = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
-MODERATE_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-COLUMN_WIDTHS = [12, 10, 12, 25, 30, 12, 40, 10, 12, 40, 40, 12, 10]
-HEADERS = [
-    "Date", "Time", "Symbol", "Company", "Filing Type", "Category",
-    "Summary", "Verdict", "Confidence", "Reason", "Risk",
-    "CMP at Filing", "Day Change %"
-]
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ============================================================
 # GLOBAL NSE SESSION
@@ -71,23 +62,11 @@ HEADERS = [
 nse_session = None
 
 # ============================================================
-# FOLDER + EXCEL SETUP
+# FOLDER SETUP
 # ============================================================
 def setup():
     os.makedirs(FILINGS_FOLDER, exist_ok=True)
-    if not os.path.exists(EXCEL_FILE):
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "NSE Filings"
-        ws.append(HEADERS)
-        for col_idx, width in enumerate(COLUMN_WIDTHS, 1):
-            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
-        for cell in ws[1]:
-            cell.font = HEADER_FONT
-            cell.fill = HEADER_FILL
-            cell.alignment = Alignment(horizontal="center")
-        wb.save(EXCEL_FILE)
-        print("   ✅ Excel file created.")
+    print("   \u2705 Supabase connected.")
 
 # ============================================================
 # CLASSIFY FILINGS
@@ -518,56 +497,30 @@ def send_watchlist_telegram(filing, symbol, company, category, group, price, cha
             print(f"   Watchlist Telegram error: {e}")
 
 # ============================================================
-# LOG TO EXCEL
+# LOG TO SUPABASE
 # ============================================================
-def log_to_excel(filing, symbol, company, analysis, price, change_pct, category):
+def log_to_supabase(filing, symbol, company, analysis, price, change_pct, category):
     now = datetime.now()
-    row_data = [
-        now.strftime("%Y-%m-%d"),
-        now.strftime("%H:%M:%S"),
-        symbol,
-        company,
-        filing.get("desc", "") or filing.get("subject", ""),
-        category,
-        analysis["summary"],
-        analysis["verdict"],
-        analysis["confidence"],
-        analysis["reason"],
-        analysis["risk"],
-        str(price),
-        f"{float(change_pct):.2f}%" if change_pct != "N/A" else "N/A"
-    ]
-
-    for attempt in range(3):
-        try:
-            wb = openpyxl.load_workbook(EXCEL_FILE)
-            ws = wb.active
-            ws.append(row_data)
-            row_idx = ws.max_row
-            if category == "HIGH":
-                for cell in ws[row_idx]:
-                    cell.fill = HIGH_FILL
-            elif category == "MODERATE":
-                for cell in ws[row_idx]:
-                    cell.fill = MODERATE_FILL
-            temp_file = EXCEL_FILE.replace(".xlsx", "_temp.xlsx")
-            backup_file = EXCEL_FILE.replace(".xlsx", "_backup.xlsx")
-            wb.save(temp_file)
-            # Keep a backup before replacing
-            if os.path.exists(EXCEL_FILE):
-                shutil.copy2(EXCEL_FILE, backup_file)
-            shutil.move(temp_file, EXCEL_FILE)
-            print(f"   \u2705 Excel logged: {symbol} [{category}]")
-            return
-        except PermissionError:
-            if attempt < 2:
-                print(f"   Excel locked, retrying in 2s... ({attempt + 1}/3)")
-                time.sleep(2)
-            else:
-                print(f"   \u26a0\ufe0f Excel locked — skipping log for {symbol}. Close the file!")
-        except Exception as e:
-            print(f"   Excel error: {e}")
-            return
+    row = {
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),
+        "symbol": symbol,
+        "company": company,
+        "filing_type": filing.get("desc", "") or filing.get("subject", ""),
+        "category": category,
+        "summary": analysis["summary"],
+        "verdict": analysis["verdict"],
+        "confidence": analysis["confidence"],
+        "reason": analysis["reason"],
+        "risk": analysis["risk"],
+        "cmp_at_filing": str(price),
+        "day_change_pct": f"{float(change_pct):.2f}%" if change_pct != "N/A" else "N/A",
+    }
+    try:
+        supabase.table("nse_filings").insert(row).execute()
+        print(f"   \u2705 Supabase logged: {symbol} [{category}]")
+    except Exception as e:
+        print(f"   Supabase error: {e}")
 
 # ============================================================
 # MAIN CHECK FUNCTION
@@ -649,8 +602,8 @@ def check_filings():
             print(f"   Sending watchlist alert for {symbol}...")
             send_watchlist_telegram(filing, symbol, company, category, watch_group, price, change_pct)
 
-        # Step 8: Log ALL to Excel
-        log_to_excel(filing, symbol, company, analysis, price, change_pct, category)
+        # Step 8: Log ALL to Supabase
+        log_to_supabase(filing, symbol, company, analysis, price, change_pct, category)
 
         time.sleep(2)
 
@@ -673,7 +626,7 @@ def send_startup_message():
 \u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}
 \U0001f4e1 Watching: ALL NSE companies
 \U0001f3af High Impact Alerts: Telegram
-\U0001f4ca All filings: Excel log
+\U0001f4ca All filings: Supabase
 \u23f1 Interval: Every 30 seconds
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -690,7 +643,7 @@ def send_startup_message():
 if __name__ == "__main__":
     print("\U0001f680 NSE Corporate Filings Monitor")
     print("   Tracking: ALL NSE companies (equities + SME + debt)")
-    print("   Alerts: HIGH impact \u2192 Telegram | ALL \u2192 Excel")
+    print("   Alerts: HIGH impact \u2192 Telegram | ALL \u2192 Supabase")
     print("   Interval: Every 30 seconds\n")
 
     setup()
@@ -722,6 +675,22 @@ if __name__ == "__main__":
     print("\n\u23f0 Monitor running. Keep this terminal open during market hours.")
     print("   Press Ctrl+C to stop.\n")
 
-    while True:
-        schedule.run_pending()
-        time.sleep(10)
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(10)
+    except KeyboardInterrupt:
+        print("\n\U0001f6d1 Shutdown signal received (Ctrl+C)...")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        msg = f"\U0001f6d1 NSE Monitor stopped manually.\n\u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}"
+        for cid in load_subscribers():
+            try:
+                resp = requests.post(url, json={"chat_id": cid, "text": msg}, timeout=10)
+                if resp.status_code == 200:
+                    print(f"   \u2705 Shutdown alert sent to {cid}")
+                else:
+                    print(f"   \u26a0\ufe0f Shutdown alert failed for {cid}: {resp.status_code}")
+            except Exception as e:
+                print(f"   \u26a0\ufe0f Shutdown alert error: {e}")
+        print("   Goodbye.")
+        sys.exit(0)
