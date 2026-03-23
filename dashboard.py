@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 import json
 import os
 from datetime import datetime
@@ -22,236 +23,288 @@ DISPLAY_COLUMNS = [
 HIDE_COLUMNS = ["Reason", "Risk", "Summary", "Date", "PDF Path"]
 
 st.set_page_config(
-    page_title="NSE Filings Terminal",
+    page_title="NSE Corporate Filings Monitor",
+    page_icon="https://www.nseindia.com/favicon.ico",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
-# ── Dark terminal theme + mobile responsive CSS ─────────────────────────
+# ── Professional financial dashboard CSS ─────────────────────────────────
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-    /* Global dark theme */
-    .stApp { background-color: #0a0e17; }
-    .block-container { padding-top: 0.5rem; padding-bottom: 0; max-width: 100%; }
-    header[data-testid="stHeader"] { background-color: #0a0e17; }
+    :root {
+        --navy: #0D1B2A;
+        --navy-light: #1B2D45;
+        --blue: #1B4F8A;
+        --blue-light: #2E6DB4;
+        --orange: #FF6B35;
+        --orange-bg: rgba(255, 107, 53, 0.08);
+        --green: #27AE60;
+        --green-bg: rgba(39, 174, 96, 0.08);
+        --red: #E74C3C;
+        --red-bg: rgba(231, 76, 60, 0.08);
+        --yellow: #F39C12;
+        --yellow-bg: rgba(243, 156, 18, 0.08);
+        --bg: #F8F9FA;
+        --card: #FFFFFF;
+        --border: #E2E8F0;
+        --text: #1A202C;
+        --text-secondary: #64748B;
+        --text-muted: #94A3B8;
+    }
 
-    /* Sidebar */
+    /* Global */
+    .stApp { background-color: var(--bg); font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+    .block-container { padding-top: 1rem; padding-bottom: 0; max-width: 100%; }
+
+    /* Sidebar - clean filter panel */
     section[data-testid="stSidebar"] {
-        background-color: #0f1420;
-        border-right: 1px solid #1a2332;
+        background-color: var(--card);
+        border-right: 1px solid var(--border);
     }
     section[data-testid="stSidebar"] .stMarkdown p,
     section[data-testid="stSidebar"] .stMarkdown label,
     section[data-testid="stSidebar"] .stRadio label {
-        color: #8899aa !important;
+        color: var(--text) !important;
         font-family: 'Inter', sans-serif;
+        font-size: 0.9rem;
     }
-    section[data-testid="stSidebar"] h2 {
-        color: #00e676 !important;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.9rem !important;
-        letter-spacing: 2px;
+    section[data-testid="stSidebar"] h3 {
+        color: var(--navy) !important;
+        font-family: 'Inter', sans-serif;
+        font-size: 0.85rem !important;
+        font-weight: 700;
         text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-bottom: 4px;
     }
 
-    /* Ticker bar */
-    .ticker-bar {
-        background: linear-gradient(90deg, #0d1a2a 0%, #112240 50%, #0d1a2a 100%);
-        border: 1px solid #1a3a5c;
-        border-radius: 4px;
-        padding: 10px 20px;
-        margin-bottom: 12px;
-        font-family: 'JetBrains Mono', monospace;
+    /* Header bar */
+    .header-bar {
+        background: linear-gradient(135deg, var(--navy) 0%, var(--navy-light) 100%);
+        padding: 14px 24px;
+        margin: 0 0 20px 0;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+    .header-left { display: flex; align-items: center; gap: 14px; }
+    .header-logo {
+        font-family: 'Inter', sans-serif;
+        font-size: 1.3rem;
+        font-weight: 700;
+        color: #FFFFFF;
+    }
+    .header-logo span { color: var(--orange); }
+    .header-subtitle {
+        font-size: 0.75rem;
+        color: rgba(255,255,255,0.6);
+        font-weight: 400;
+    }
+    .header-right { display: flex; align-items: center; gap: 14px; }
+    .header-time {
+        font-family: 'Inter', sans-serif;
+        font-size: 0.8rem;
+        color: rgba(255,255,255,0.8);
+        font-weight: 500;
+    }
+    .market-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+    }
+    .market-pill.open { background: rgba(39,174,96,0.2); color: #27AE60; }
+    .market-pill.closed { background: rgba(231,76,60,0.15); color: #E74C3C; }
+    .market-pill .dot {
+        width: 6px; height: 6px;
+        border-radius: 50%;
+        display: inline-block;
+    }
+    .market-pill.open .dot { background: #27AE60; }
+    .market-pill.closed .dot { background: #E74C3C; }
+    .live-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 4px 10px;
+        border-radius: 20px;
+        background: rgba(39,174,96,0.15);
+        font-size: 0.65rem;
+        font-weight: 600;
+        color: #27AE60;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    @keyframes blink { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+    .live-pill .dot {
+        width: 6px; height: 6px;
+        background: #27AE60;
+        border-radius: 50%;
+        display: inline-block;
+        animation: blink 1.5s ease-in-out infinite;
+    }
+
+    /* Latest filing bar */
+    .latest-bar {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-left: 3px solid var(--blue);
+        border-radius: 6px;
+        padding: 10px 18px;
+        margin-bottom: 16px;
         font-size: 0.85rem;
-        color: #4fc3f7;
+        color: var(--text);
+        display: flex;
+        align-items: center;
+        gap: 8px;
         overflow: hidden;
         white-space: nowrap;
         text-overflow: ellipsis;
     }
-    .ticker-label {
-        color: #ff9800;
+    .latest-bar .label {
+        color: var(--blue);
         font-weight: 700;
-        margin-right: 8px;
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        flex-shrink: 0;
     }
+    .latest-bar .sep { color: var(--border); margin: 0 4px; }
 
-    /* Header area */
-    .terminal-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 8px 0 4px 0;
-        border-bottom: 1px solid #1a2332;
-        margin-bottom: 14px;
-        flex-wrap: wrap;
-        gap: 8px;
-    }
-    .terminal-title {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 1.5rem;
-        font-weight: 700;
-        color: #e0e0e0;
-        letter-spacing: 1px;
-    }
-    .terminal-title span.nse { color: #2196F3; }
-    .terminal-title span.dot { color: #ff9800; }
-
-    /* Market status */
-    .market-badge {
+    /* Category pills */
+    .cat-pill {
         display: inline-block;
-        padding: 4px 14px;
-        border-radius: 4px;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.75rem;
-        font-weight: 700;
-        letter-spacing: 1px;
-    }
-    .market-open {
-        background: rgba(0, 230, 118, 0.15);
-        color: #00e676;
-        border: 1px solid #00e676;
-    }
-    .market-closed {
-        background: rgba(255, 68, 68, 0.15);
-        color: #ff4444;
-        border: 1px solid #ff4444;
-    }
-
-    /* Pulsing live indicator */
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.3; }
-    }
-    .live-dot {
-        display: inline-block;
-        width: 8px; height: 8px;
-        background: #00e676;
-        border-radius: 50%;
-        margin-right: 6px;
-        animation: pulse 1.5s ease-in-out infinite;
-        box-shadow: 0 0 8px #00e676;
-    }
-    .live-badge {
-        display: inline-flex;
-        align-items: center;
-        padding: 4px 12px;
-        border-radius: 4px;
-        background: rgba(0, 230, 118, 0.1);
-        border: 1px solid rgba(0, 230, 118, 0.3);
-        font-family: 'JetBrains Mono', monospace;
+        padding: 2px 10px;
+        border-radius: 12px;
         font-size: 0.7rem;
         font-weight: 600;
-        color: #00e676;
-        letter-spacing: 2px;
-        text-transform: uppercase;
     }
+    .cat-high { background: var(--orange-bg); color: var(--orange); border: 1px solid rgba(255,107,53,0.25); }
+    .cat-moderate { background: var(--yellow-bg); color: var(--yellow); border: 1px solid rgba(243,156,18,0.25); }
+    .cat-routine { background: rgba(100,116,139,0.08); color: var(--text-secondary); border: 1px solid rgba(100,116,139,0.15); }
 
     /* Metric cards */
     .metric-card {
-        background: linear-gradient(135deg, #0f1a2e 0%, #132238 100%);
-        border: 1px solid #1a2d47;
-        border-radius: 8px;
-        padding: 14px 18px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 16px 18px;
         text-align: center;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
     }
     .metric-value {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 2rem;
+        font-family: 'Inter', sans-serif;
+        font-size: 1.8rem;
         font-weight: 700;
         line-height: 1.1;
     }
     .metric-label {
-        font-family: 'Inter', sans-serif;
         font-size: 0.7rem;
-        color: #5a6f8a;
+        color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 1.5px;
+        letter-spacing: 0.8px;
         margin-top: 4px;
         font-weight: 600;
     }
-    .val-blue     { color: #4fc3f7; }
-    .val-green    { color: #00e676; }
-    .val-yellow   { color: #ffd740; }
-    .val-grey     { color: #78909c; }
-    .val-white    { color: #cfd8dc; }
-    .val-cyan     { color: #00bcd4; }
-    .val-purple   { color: #bb86fc; }
+    .val-total { color: var(--navy); }
+    .val-high  { color: var(--orange); }
+    .val-mod   { color: var(--yellow); }
+    .val-rout  { color: var(--text-muted); }
+    .val-comp  { color: var(--blue); }
+    .val-wl    { color: #7C3AED; }
 
     /* Section headers */
-    .section-header {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.8rem;
-        color: #5a6f8a;
-        letter-spacing: 2px;
-        text-transform: uppercase;
-        border-bottom: 1px solid #1a2332;
-        padding-bottom: 6px;
-        margin: 16px 0 10px 0;
+    .section-title {
+        font-size: 0.95rem;
+        font-weight: 700;
+        color: var(--navy);
+        padding-bottom: 8px;
+        margin: 18px 0 10px 0;
+        border-bottom: 2px solid var(--border);
     }
 
-    /* Watchlist badge */
-    .watchlist-tag {
+    /* Watchlist tag */
+    .wl-tag {
         display: inline-block;
         padding: 2px 8px;
-        border-radius: 3px;
-        background: rgba(187, 134, 252, 0.15);
-        border: 1px solid #bb86fc;
-        color: #bb86fc;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.65rem;
+        border-radius: 4px;
+        background: rgba(124, 58, 237, 0.08);
+        border: 1px solid rgba(124, 58, 237, 0.2);
+        color: #7C3AED;
+        font-size: 0.72rem;
         font-weight: 600;
-        letter-spacing: 1px;
     }
 
-    /* Dataframe overrides */
+    /* Dataframe - clean borders */
     .stDataFrame {
-        border: 1px solid #1a2d47;
-        border-radius: 6px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
     }
 
     /* Tab styling */
     .stTabs [data-baseweb="tab-list"] {
         gap: 0;
-        border-bottom: 1px solid #1a2332;
+        border-bottom: 2px solid var(--border);
     }
     .stTabs [data-baseweb="tab"] {
-        background-color: #0a0e17;
-        color: #5a6f8a;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.8rem;
-        letter-spacing: 1px;
-        border: 1px solid #1a2332;
-        border-bottom: none;
-        border-radius: 4px 4px 0 0;
-        padding: 8px 20px;
+        background-color: transparent;
+        color: var(--text-secondary);
+        font-family: 'Inter', sans-serif;
+        font-size: 0.85rem;
+        font-weight: 600;
+        border: none;
+        border-bottom: 2px solid transparent;
+        border-radius: 0;
+        padding: 10px 20px;
+        margin-bottom: -2px;
     }
     .stTabs [aria-selected="true"] {
-        background-color: #132238 !important;
-        color: #4fc3f7 !important;
-        border-color: #2196F3 !important;
+        background-color: transparent !important;
+        color: var(--blue) !important;
+        border-bottom: 2px solid var(--blue) !important;
     }
 
-    /* Hide default streamlit elements */
-    #MainMenu, footer, .stDeployButton { display: none; }
-    .stSubheader { color: #8899aa !important; }
+    /* Hide Streamlit chrome */
+    #MainMenu { visibility: hidden; }
+    header { visibility: hidden; height: 0; min-height: 0; padding: 0; }
+    footer { visibility: hidden; }
+    .stDeployButton { display: none; }
 
-    /* ── Mobile responsive ── */
+    /* Footer text */
+    .footer-text {
+        text-align: center;
+        font-size: 0.7rem;
+        color: var(--text-muted);
+        margin-top: 12px;
+        padding: 8px 0;
+        border-top: 1px solid var(--border);
+    }
+
+    /* Mobile */
     @media (max-width: 768px) {
+        .header-bar { padding: 10px 14px; flex-direction: column; align-items: flex-start; }
+        .header-logo { font-size: 1.1rem; }
+        .metric-card { padding: 10px 12px; }
+        .metric-value { font-size: 1.3rem; }
+        .metric-label { font-size: 0.6rem; }
+        .latest-bar { font-size: 0.75rem; padding: 8px 12px; }
         .block-container { padding-left: 0.5rem; padding-right: 0.5rem; }
-        .terminal-title { font-size: 1rem; }
-        .terminal-header { flex-direction: column; align-items: flex-start; }
-        .metric-card { padding: 8px 10px; }
-        .metric-value { font-size: 1.4rem; }
-        .metric-label { font-size: 0.6rem; letter-spacing: 1px; }
-        .ticker-bar { font-size: 0.7rem; padding: 8px 12px; }
-        .section-header { font-size: 0.7rem; }
     }
     @media (max-width: 480px) {
-        .terminal-title { font-size: 0.85rem; }
+        .header-logo { font-size: 0.95rem; }
         .metric-value { font-size: 1.1rem; }
-        .live-badge { font-size: 0.6rem; padding: 3px 8px; }
-        .market-badge { font-size: 0.6rem; padding: 3px 8px; }
+        .market-pill, .live-pill { font-size: 0.6rem; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -263,8 +316,8 @@ def get_market_status():
     weekday = now.weekday()
     hour_min = now.hour * 100 + now.minute
     if weekday < 5 and 915 <= hour_min <= 1530:
-        return True, "MARKET OPEN"
-    return False, "MARKET CLOSED"
+        return True, "Market Open"
+    return False, "Market Closed"
 
 
 def load_data():
@@ -273,7 +326,6 @@ def load_data():
         if not response.data:
             return pd.DataFrame()
         df = pd.DataFrame(response.data)
-        # Rename Supabase columns to match dashboard display names
         col_map = {
             "date": "Date",
             "time": "Time",
@@ -294,7 +346,7 @@ def load_data():
             df["Category"] = df["Category"].astype(str).str.strip().str.upper()
         return df
     except Exception as e:
-        st.error(f"Supabase error: {e}")
+        st.error(f"Database connection error: {e}")
         return pd.DataFrame()
 
 
@@ -313,74 +365,126 @@ def get_watchlist_symbols():
     return all_symbols
 
 
-def color_row(row):
+def style_row(row):
+    styles = []
     cat = str(row.get("Category", "")).upper()
-    if cat == "HIGH":
-        return ["background-color: #00B050; color: white; font-weight: 600"] * len(row)
-    elif cat == "MODERATE":
-        return ["background-color: #3d3d00; color: #ffd740"] * len(row)
-    return ["background-color: #0f1420; color: #8899aa"] * len(row)
+    for col in row.index:
+        s = ""
+        # Left border on first column based on category
+        if col == row.index[0]:
+            if cat == "HIGH":
+                s += "border-left: 3px solid #FF6B35; font-weight: 500; "
+            elif cat == "MODERATE":
+                s += "border-left: 3px solid #F39C12; "
+        # Category cell coloring
+        if col == "Category":
+            if cat == "HIGH":
+                s += "background-color: rgba(255,107,53,0.12); color: #FF6B35; font-weight: 600; border-radius: 4px; "
+            elif cat == "MODERATE":
+                s += "background-color: rgba(243,156,18,0.12); color: #D4850A; font-weight: 600; border-radius: 4px; "
+            else:
+                s += "background-color: rgba(100,116,139,0.08); color: #64748B; border-radius: 4px; "
+        # Verdict cell coloring
+        if col == "Verdict":
+            v = str(row.get("Verdict", "")).upper()
+            if "BULLISH" in v:
+                s += "background-color: rgba(39,174,96,0.12); color: #27AE60; font-weight: 600; border-radius: 4px; "
+            elif "BEARISH" in v:
+                s += "background-color: rgba(231,76,60,0.12); color: #E74C3C; font-weight: 600; border-radius: 4px; "
+            elif "NEUTRAL" in v:
+                s += "background-color: rgba(100,116,139,0.08); color: #64748B; border-radius: 4px; "
+        styles.append(s)
+    return styles
 
 
-def color_row_watchlist(row):
+def style_row_watchlist(row):
+    styles = []
     cat = str(row.get("Category", "")).upper()
+    for col in row.index:
+        s = ""
+        if col == row.index[0]:
+            if cat == "HIGH":
+                s += "border-left: 3px solid #FF6B35; font-weight: 500; "
+            elif cat == "MODERATE":
+                s += "border-left: 3px solid #F39C12; "
+            else:
+                s += "border-left: 3px solid #7C3AED; "
+        if col == "Category":
+            if cat == "HIGH":
+                s += "background-color: rgba(255,107,53,0.12); color: #FF6B35; font-weight: 600; border-radius: 4px; "
+            elif cat == "MODERATE":
+                s += "background-color: rgba(243,156,18,0.12); color: #D4850A; font-weight: 600; border-radius: 4px; "
+            else:
+                s += "background-color: rgba(100,116,139,0.08); color: #64748B; border-radius: 4px; "
+        if col == "Verdict":
+            v = str(row.get("Verdict", "")).upper()
+            if "BULLISH" in v:
+                s += "background-color: rgba(39,174,96,0.12); color: #27AE60; font-weight: 600; border-radius: 4px; "
+            elif "BEARISH" in v:
+                s += "background-color: rgba(231,76,60,0.12); color: #E74C3C; font-weight: 600; border-radius: 4px; "
+            elif "NEUTRAL" in v:
+                s += "background-color: rgba(100,116,139,0.08); color: #64748B; border-radius: 4px; "
+        styles.append(s)
+    return styles
+
+
+def cat_pill(cat):
+    cat = str(cat).upper()
     if cat == "HIGH":
-        return ["background-color: #00B050; color: white; font-weight: 600"] * len(row)
+        return '<span class="cat-pill cat-high">HIGH</span>'
     elif cat == "MODERATE":
-        return ["background-color: #3d3d00; color: #ffd740"] * len(row)
-    return ["background-color: #1a1040; color: #bb86fc"] * len(row)
+        return '<span class="cat-pill cat-moderate">MODERATE</span>'
+    return '<span class="cat-pill cat-routine">ROUTINE</span>'
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────
-st.sidebar.markdown("## // Filters")
+st.sidebar.markdown("### Filter by Category")
 risk_filter = st.sidebar.radio(
     "Category",
     ["ALL", "HIGH", "MODERATE", "ROUTINE"],
     index=0,
 )
 st.sidebar.markdown("---")
-st.sidebar.markdown(
-    '<div class="live-badge"><span class="live-dot"></span>SYSTEM LIVE</div>',
-    unsafe_allow_html=True,
-)
-st.sidebar.caption("Auto-refresh: 30s cycle")
+st.sidebar.caption("Auto-refreshes every 30 seconds")
 st.sidebar.markdown("---")
 
-# Show watchlist groups in sidebar
 watchlist = load_watchlist()
 if watchlist:
-    st.sidebar.markdown("## // Watchlist")
+    st.sidebar.markdown("### Watchlist Groups")
     for group, symbols in watchlist.items():
         st.sidebar.markdown(
-            f'<span class="watchlist-tag">{group}</span> '
-            f'<span style="color:#5a6f8a;font-size:0.7rem;font-family:JetBrains Mono,monospace;">'
-            f'{len(symbols)} stocks</span>',
+            f'<span class="wl-tag">{group}</span> '
+            f'<span style="color:#64748B;font-size:0.75rem;">{len(symbols)} stocks</span>',
             unsafe_allow_html=True,
         )
     st.sidebar.markdown("---")
 
 st.sidebar.markdown(
-    f'<p style="color:#3a4a5c;font-size:0.7rem;font-family:JetBrains Mono,monospace;">'
-    f'Session: {datetime.now().strftime("%d %b %Y")}<br>'
-    f'Engine: Gemini 2.0 Flash<br>'
-    f'Feed: NSE Corp Announcements<br>'
-    f'DB: Supabase Cloud</p>',
+    f'<p style="color:#94A3B8;font-size:0.72rem;">'
+    f'{datetime.now().strftime("%d %b %Y")}<br>'
+    f'AI: Gemini 2.0 Flash<br>'
+    f'Source: NSE India</p>',
     unsafe_allow_html=True,
 )
 
 
 # ── Header ───────────────────────────────────────────────────────────────
 is_open, market_label = get_market_status()
-market_css = "market-open" if is_open else "market-closed"
+market_class = "open" if is_open else "closed"
+now_time = datetime.now().strftime("%H:%M:%S IST")
 
 st.markdown(f"""
-<div class="terminal-header">
-    <div>
-        <span class="terminal-title"><span class="nse">NSE</span><span class="dot">.</span>FILINGS TERMINAL</span>
+<div class="header-bar">
+    <div class="header-left">
+        <div>
+            <div class="header-logo">NSE <span>Filings</span> Monitor</div>
+            <div class="header-subtitle">Real-time Corporate Announcements Intelligence</div>
+        </div>
     </div>
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-        <div class="live-badge"><span class="live-dot"></span>SYSTEM LIVE</div>
-        <div class="market-badge {market_css}">{market_label}</div>
+    <div class="header-right">
+        <div class="live-pill"><span class="dot"></span> Live</div>
+        <div class="market-pill {market_class}"><span class="dot"></span> {market_label}</div>
+        <div class="header-time">{now_time}</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -392,11 +496,7 @@ def filings_table():
     df = load_data()
 
     if df.empty:
-        st.markdown(
-            '<p style="color:#ff4444;font-family:JetBrains Mono,monospace;">'
-            '> No data. Waiting for filings feed...</p>',
-            unsafe_allow_html=True,
-        )
+        st.info("No filings data available. Waiting for the monitor to push data...")
         return
 
     # Sort by time descending
@@ -405,23 +505,23 @@ def filings_table():
     else:
         sorted_df = df
 
-    # ── Ticker bar: most recent filing ──
+    # ── Latest filing bar ──
     latest = sorted_df.iloc[0]
     ticker_symbol = latest.get("Symbol", "---")
     ticker_type = latest.get("Filing Type", "")
     ticker_cat = latest.get("Category", "")
     ticker_time = latest.get("Time", "")
-    cat_color = "#00e676" if ticker_cat == "HIGH" else "#ffd740" if ticker_cat == "MODERATE" else "#5a6f8a"
     st.markdown(
-        f'<div class="ticker-bar">'
-        f'<span class="ticker-label">LATEST</span> '
-        f'<span style="color:white;font-weight:700;">{ticker_symbol}</span> '
-        f'<span style="color:#5a6f8a;">|</span> '
-        f'{ticker_type} '
-        f'<span style="color:#5a6f8a;">|</span> '
-        f'<span style="color:{cat_color};font-weight:600;">[{ticker_cat}]</span> '
-        f'<span style="color:#5a6f8a;">|</span> '
-        f'<span style="color:#5a6f8a;">{ticker_time}</span>'
+        f'<div class="latest-bar">'
+        f'<span class="label">Latest Filing</span>'
+        f'<span class="sep">|</span>'
+        f'<strong>{ticker_symbol}</strong>'
+        f'<span class="sep">|</span>'
+        f'{ticker_type}'
+        f'<span class="sep">|</span>'
+        f'{cat_pill(ticker_cat)}'
+        f'<span class="sep">|</span>'
+        f'<span style="color:#94A3B8;">{ticker_time}</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -439,55 +539,71 @@ def filings_table():
     with c1:
         st.markdown(
             f'<div class="metric-card">'
-            f'<div class="metric-value val-blue">{total}</div>'
+            f'<div class="metric-value val-total">{total}</div>'
             f'<div class="metric-label">Total Filings</div></div>',
             unsafe_allow_html=True)
     with c2:
         st.markdown(
             f'<div class="metric-card">'
-            f'<div class="metric-value val-green">{high_count}</div>'
+            f'<div class="metric-value val-high">{high_count}</div>'
             f'<div class="metric-label">High Impact</div></div>',
             unsafe_allow_html=True)
     with c3:
         st.markdown(
             f'<div class="metric-card">'
-            f'<div class="metric-value val-yellow">{mod_count}</div>'
+            f'<div class="metric-value val-mod">{mod_count}</div>'
             f'<div class="metric-label">Moderate</div></div>',
             unsafe_allow_html=True)
     with c4:
         st.markdown(
             f'<div class="metric-card">'
-            f'<div class="metric-value val-grey">{routine_count}</div>'
+            f'<div class="metric-value val-rout">{routine_count}</div>'
             f'<div class="metric-label">Routine</div></div>',
             unsafe_allow_html=True)
     with c5:
         st.markdown(
             f'<div class="metric-card">'
-            f'<div class="metric-value val-cyan">{unique_companies}</div>'
+            f'<div class="metric-value val-comp">{unique_companies}</div>'
             f'<div class="metric-label">Companies</div></div>',
             unsafe_allow_html=True)
     with c6:
         st.markdown(
             f'<div class="metric-card">'
-            f'<div class="metric-value val-purple">{wl_count}</div>'
+            f'<div class="metric-value val-wl">{wl_count}</div>'
             f'<div class="metric-label">Watchlist Hits</div></div>',
             unsafe_allow_html=True)
 
     # ── Category breakdown chart ──
-    st.markdown('<div class="section-header">// Category Breakdown</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Category Breakdown</div>', unsafe_allow_html=True)
     chart_data = pd.DataFrame({
         "Category": ["HIGH", "MODERATE", "ROUTINE"],
         "Count": [high_count, mod_count, routine_count],
+        "Color": ["#FF6B35", "#F39C12", "#94A3B8"],
     })
     chart_data = chart_data[chart_data["Count"] > 0]
     if not chart_data.empty:
-        st.bar_chart(chart_data.set_index("Category"), color="#2196F3", height=150)
+        fig = px.bar(
+            chart_data, x="Count", y="Category", orientation="h",
+            color="Category",
+            color_discrete_map={"HIGH": "#FF6B35", "MODERATE": "#F39C12", "ROUTINE": "#94A3B8"},
+            text="Count",
+        )
+        fig.update_layout(
+            height=140, margin=dict(l=0, r=0, t=0, b=0),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            showlegend=False,
+            xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+            yaxis=dict(showgrid=False, categoryorder="array", categoryarray=["ROUTINE", "MODERATE", "HIGH"]),
+            font=dict(family="Inter, sans-serif", size=13),
+        )
+        fig.update_traces(textposition="outside", textfont_size=12)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
     # ── Tabs: All Filings + Watchlist ──
-    tab_all, tab_watchlist = st.tabs(["ALL FILINGS", "WATCHLIST ALERTS"])
+    tab_all, tab_watchlist = st.tabs(["All Filings", "Watchlist Alerts"])
 
     with tab_all:
-        st.markdown('<div class="section-header">// Live Filings Feed</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Live Filings Feed</div>', unsafe_allow_html=True)
 
         if risk_filter != "ALL" and "Category" in df.columns:
             filtered = sorted_df[sorted_df["Category"] == risk_filter].copy()
@@ -498,48 +614,36 @@ def filings_table():
         display_df = filtered[show_cols].reset_index(drop=True)
 
         if display_df.empty:
-            st.markdown(
-                '<p style="color:#5a6f8a;font-family:JetBrains Mono,monospace;">'
-                '> No filings match filter.</p>',
-                unsafe_allow_html=True,
-            )
+            st.info("No filings match the selected filter.")
         else:
             styled = (
                 display_df.style
-                .apply(color_row, axis=1)
+                .apply(style_row, axis=1)
                 .set_properties(**{
                     "text-align": "left",
                     "font-size": "0.85rem",
-                    "font-family": "JetBrains Mono, monospace",
+                    "font-family": "Inter, sans-serif",
+                    "border-bottom": "1px solid #E2E8F0",
                 })
             )
             st.dataframe(styled, use_container_width=True, height=500, hide_index=True)
             st.markdown(
-                f'<p style="color:#2a3a4a;font-size:0.65rem;font-family:JetBrains Mono,monospace;text-align:right;margin-top:4px;">'
-                f'{len(display_df)} records | Filtered: {risk_filter} | Refresh: 30s</p>',
+                f'<p style="color:#94A3B8;font-size:0.72rem;text-align:right;margin-top:4px;">'
+                f'{len(display_df)} records &middot; Filter: {risk_filter} &middot; Refreshes every 30s</p>',
                 unsafe_allow_html=True,
             )
 
     with tab_watchlist:
-        st.markdown('<div class="section-header">// Watchlist Filings</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Watchlist Filings</div>', unsafe_allow_html=True)
 
         if not wl_symbols:
-            st.markdown(
-                '<p style="color:#5a6f8a;font-family:JetBrains Mono,monospace;">'
-                '> No watchlist configured. Edit watchlist.json to add stocks.</p>',
-                unsafe_allow_html=True,
-            )
+            st.info("No watchlist configured. Add stocks to watchlist.json to track them here.")
         else:
             wl_df = sorted_df[sorted_df["Symbol"].isin(wl_symbols)].copy() if "Symbol" in sorted_df.columns else pd.DataFrame()
 
             if wl_df.empty:
-                st.markdown(
-                    '<p style="color:#5a6f8a;font-family:JetBrains Mono,monospace;">'
-                    '> No filings from watchlisted stocks yet.</p>',
-                    unsafe_allow_html=True,
-                )
+                st.info("No filings from watchlisted stocks yet.")
             else:
-                # Show which watchlist group each symbol belongs to
                 wl_map = load_watchlist()
                 group_lookup = {}
                 for group, syms in wl_map.items():
@@ -552,24 +656,26 @@ def filings_table():
 
                 styled_wl = (
                     wl_display.style
-                    .apply(color_row_watchlist, axis=1)
+                    .apply(style_row_watchlist, axis=1)
                     .set_properties(**{
                         "text-align": "left",
                         "font-size": "0.85rem",
-                        "font-family": "JetBrains Mono, monospace",
+                        "font-family": "Inter, sans-serif",
+                        "border-bottom": "1px solid #E2E8F0",
                     })
                 )
                 st.dataframe(styled_wl, use_container_width=True, height=500, hide_index=True)
                 st.markdown(
-                    f'<p style="color:#2a3a4a;font-size:0.65rem;font-family:JetBrains Mono,monospace;text-align:right;margin-top:4px;">'
-                    f'{len(wl_display)} watchlist filings | {len(wl_symbols)} stocks tracked</p>',
+                    f'<p style="color:#94A3B8;font-size:0.72rem;text-align:right;margin-top:4px;">'
+                    f'{len(wl_display)} watchlist filings &middot; {len(wl_symbols)} stocks tracked</p>',
                     unsafe_allow_html=True,
                 )
 
-    # ── Last refresh time ──
+    # ── Footer ──
     st.markdown(
-        f'<p style="color:#1a2a3a;font-size:0.6rem;font-family:JetBrains Mono,monospace;text-align:center;margin-top:8px;">'
-        f'Last refresh: {datetime.now().strftime("%H:%M:%S")} | Powered by Supabase</p>',
+        f'<div class="footer-text">'
+        f'Last refresh: {datetime.now().strftime("%H:%M:%S IST")} &middot; '
+        f'Powered by Supabase &middot; AI by Gemini &middot; Data from NSE India</div>',
         unsafe_allow_html=True,
     )
 
