@@ -12,6 +12,7 @@ import time
 import os
 import shutil
 import schedule
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from google import genai
@@ -40,6 +41,12 @@ WATCHLIST_FILE = os.path.join(BASE_FOLDER, "watchlist.json")
 # Price movement tracking: {symbol: {"price": float, "time": datetime}}
 price_tracker = {}
 
+# Schema flags — detected at startup
+HAS_EXCHANGE_COL = False
+HAS_CONFIDENCE_PCT_COL = False
+HAS_EVIDENCE_COL = False
+HAS_ACTION_WINDOW_COL = False
+
 # ============================================================
 # GEMINI SETUP
 # ============================================================
@@ -56,17 +63,44 @@ def rotate_gemini_key():
 # ============================================================
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+def detect_schema():
+    """Check which optional columns exist in Supabase."""
+    global HAS_EXCHANGE_COL, HAS_CONFIDENCE_PCT_COL, HAS_EVIDENCE_COL, HAS_ACTION_WINDOW_COL
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
+    for col, flag_name in [
+        ("exchange", "HAS_EXCHANGE_COL"),
+        ("confidence_pct", "HAS_CONFIDENCE_PCT_COL"),
+        ("evidence", "HAS_EVIDENCE_COL"),
+        ("action_window", "HAS_ACTION_WINDOW_COL"),
+    ]:
+        try:
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/nse_filings?select={col}&limit=1",
+                headers=headers, timeout=10
+            )
+            globals()[flag_name] = (r.status_code == 200)
+        except Exception:
+            globals()[flag_name] = False
+    print(f"   Schema: exchange={HAS_EXCHANGE_COL}, confidence_pct={HAS_CONFIDENCE_PCT_COL}, evidence={HAS_EVIDENCE_COL}, action_window={HAS_ACTION_WINDOW_COL}")
+    if not all([HAS_EXCHANGE_COL, HAS_CONFIDENCE_PCT_COL, HAS_EVIDENCE_COL, HAS_ACTION_WINDOW_COL]):
+        print("   ⚠️  Some columns missing. Run: python migrate_db.py")
+
 # ============================================================
-# GLOBAL NSE SESSION
+# GLOBAL SESSIONS
 # ============================================================
 nse_session = None
+bse_session = None
 
 # ============================================================
 # FOLDER SETUP
 # ============================================================
 def setup():
     os.makedirs(FILINGS_FOLDER, exist_ok=True)
-    print("   \u2705 Supabase connected.")
+    detect_schema()
+    print("   ✅ Supabase connected.")
 
 # ============================================================
 # CLASSIFY FILINGS
@@ -99,7 +133,7 @@ def classify_filing(subject, pdf_text=""):
     return "ROUTINE"
 
 # ============================================================
-# SEEN FILINGS
+# SEEN FILINGS (with exchange prefix)
 # ============================================================
 def load_seen():
     if os.path.exists(SEEN_FILINGS_FILE):
@@ -146,7 +180,7 @@ def check_price_movements():
     """Check if tracked HIGH filing stocks moved >2% within 10 min."""
     if not price_tracker:
         return
-    session = get_session()
+    session = get_nse_session()
     now = datetime.now()
     expired = []
     for symbol, data in list(price_tracker.items()):
@@ -155,7 +189,7 @@ def check_price_movements():
             continue
         expired.append(symbol)
         try:
-            current_price, _ = get_live_price(session, symbol)
+            current_price, _ = get_nse_price(session, symbol)
             if current_price == "N/A":
                 continue
             current = float(str(current_price).replace(",", ""))
@@ -231,21 +265,53 @@ def create_nse_session():
         print(f"   Session setup warning: {e}")
     return session
 
-def get_session():
+def get_nse_session():
     global nse_session
     if nse_session is None:
         nse_session = create_nse_session()
     return nse_session
 
-def reset_session():
+def reset_nse_session():
     global nse_session
     print("   Resetting NSE session...")
     nse_session = None
 
 # ============================================================
-# FETCH FILINGS (3 PARALLEL NSE CALLS)
+# BSE SESSION
 # ============================================================
-def fetch_filings(session):
+def create_bse_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.bseindia.com/corporates/ann.html",
+        "Origin": "https://www.bseindia.com",
+    })
+    try:
+        print("   Warming up BSE session...")
+        session.get("https://www.bseindia.com", timeout=15)
+        time.sleep(2)
+        print("   ✅ BSE session ready.")
+    except Exception as e:
+        print(f"   BSE session setup warning: {e}")
+    return session
+
+def get_bse_session():
+    global bse_session
+    if bse_session is None:
+        bse_session = create_bse_session()
+    return bse_session
+
+def reset_bse_session():
+    global bse_session
+    print("   Resetting BSE session...")
+    bse_session = None
+
+# ============================================================
+# FETCH NSE FILINGS (3 PARALLEL CALLS)
+# ============================================================
+def fetch_nse_filings(session):
     today = datetime.now().strftime("%d-%m-%Y")
     urls = {
         "equities": f"https://www.nseindia.com/api/corporate-announcements?index=equities&from_date={today}&to_date={today}",
@@ -266,7 +332,7 @@ def fetch_filings(session):
                 counts[name] = len(data)
                 return data
         except Exception as e:
-            print(f"   Error fetching {name}: {e}")
+            print(f"   Error fetching NSE {name}: {e}")
         counts[name] = 0
         return []
 
@@ -284,13 +350,64 @@ def fetch_filings(session):
     eq = counts.get("equities", 0)
     sm = counts.get("sme", 0)
     dt = counts.get("debt", 0)
-    print(f"   ✅ Fetched {len(combined)} total filings for today (equities: {eq}, sme: {sm}, debt: {dt})")
+    print(f"   ✅ NSE: {len(combined)} filings (equities: {eq}, sme: {sm}, debt: {dt})")
     return combined
 
 # ============================================================
-# GET LIVE STOCK PRICE
+# FETCH BSE FILINGS
 # ============================================================
-def get_live_price(session, symbol):
+def fetch_bse_filings(session):
+    """Fetch corporate announcements from BSE India API."""
+    today = datetime.now().strftime("%d/%m/%Y")
+    url = (
+        f"https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w"
+        f"?strCat=-1&strPrevDate={today}&strScrip=&strSearch=&Is498=&strType=C"
+    )
+    try:
+        response = session.get(url, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            table = data.get("Table", [])
+            print(f"   ✅ BSE: {len(table)} filings fetched")
+            return table
+    except Exception as e:
+        print(f"   Error fetching BSE: {e}")
+    return []
+
+def map_bse_filing(item):
+    """Map BSE API fields to our standard schema."""
+    # BSE fields: SCRIP_CD, SLONGNAME, NEWSSUB, NEWS_DT, ATTACHMENTNAME, NSURL,
+    #             DT_TM, HEADLINE, CATEGORYNAME, SUBCATNAME, NSEID
+    symbol = (item.get("NSEID") or item.get("SCRIP_CD", "")).strip().upper()
+    company = (item.get("SLONGNAME") or symbol).strip()
+    subject = (item.get("NEWSSUB") or item.get("HEADLINE") or "").strip()
+    news_dt = item.get("NEWS_DT", "")
+    news_id = item.get("NEWSID") or item.get("ANNOESSION_ID") or item.get("NEWS_DT", "")
+    attach = item.get("ATTACHMENTNAME", "")
+    nsurl = item.get("NSURL", "")
+
+    # Build attachment URL
+    attach_url = ""
+    if attach:
+        attach_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}"
+    elif nsurl:
+        attach_url = nsurl
+
+    return {
+        "symbol": symbol,
+        "company": company,
+        "desc": subject,
+        "subject": subject,
+        "attchmntFile": attach_url,
+        "an_dt": news_dt,
+        "seqNo": str(news_id),
+        "_bse_raw": item,
+    }
+
+# ============================================================
+# GET LIVE STOCK PRICE (NSE)
+# ============================================================
+def get_nse_price(session, symbol):
     try:
         url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
         response = session.get(url, timeout=10)
@@ -301,19 +418,40 @@ def get_live_price(session, symbol):
             change_pct = price_info.get("pChange", "N/A")
             return price, change_pct
     except Exception as e:
-        print(f"   Price fetch error for {symbol}: {e}")
+        print(f"   NSE price fetch error for {symbol}: {e}")
+    return "N/A", "N/A"
+
+# ============================================================
+# GET LIVE STOCK PRICE (BSE)
+# ============================================================
+def get_bse_price(session, scrip_code):
+    """Get live price from BSE. Falls back to N/A if unavailable."""
+    try:
+        url = f"https://api.bseindia.com/BseIndiaAPI/api/getScripHeaderData/w?Ession=&scripcode={scrip_code}"
+        response = session.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            header = data.get("Header", {})
+            price = header.get("LTP") or header.get("CurrRate") or "N/A"
+            change_pct = header.get("ChgPer") or header.get("Chg") or "N/A"
+            return price, change_pct
+    except Exception as e:
+        print(f"   BSE price fetch error for {scrip_code}: {e}")
     return "N/A", "N/A"
 
 # ============================================================
 # DOWNLOAD PDF
 # ============================================================
-def download_pdf(session, filing, symbol):
+def download_pdf(session, filing, symbol, exchange="NSE"):
     try:
         attach_url = filing.get("attchmntFile", "") or filing.get("attachment", "")
         if not attach_url:
             return None
         if not attach_url.startswith("http"):
-            attach_url = "https://www.nseindia.com" + attach_url
+            if exchange == "BSE":
+                attach_url = "https://www.bseindia.com" + attach_url
+            else:
+                attach_url = "https://www.nseindia.com" + attach_url
 
         company_folder = os.path.join(FILINGS_FOLDER, symbol)
         os.makedirs(company_folder, exist_ok=True)
@@ -321,7 +459,7 @@ def download_pdf(session, filing, symbol):
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
         subject_clean = (filing.get("desc", "") or filing.get("subject", "filing"))[:40]
         subject_clean = "".join(c for c in subject_clean if c.isalnum() or c in " -_").strip()
-        filename = f"{date_str}_{subject_clean}.pdf"
+        filename = f"{exchange}_{date_str}_{subject_clean}.pdf"
         filepath = os.path.join(company_folder, filename)
 
         pdf_session = requests.Session()
@@ -354,12 +492,13 @@ def extract_pdf_text(pdf_path):
     return ""
 
 # ============================================================
-# GEMINI ANALYSIS (HIGH FILINGS ONLY)
+# GEMINI ANALYSIS (HIGH FILINGS ONLY) — STRUCTURED JSON
 # ============================================================
-def analyze_with_gemini(filing_text, subject, symbol, price, change_pct):
-    prompt = f"""You are a senior Indian equity analyst. Analyze this NSE corporate filing and give a sharp market impact assessment.
+def analyze_with_gemini(filing_text, subject, symbol, price, change_pct, exchange="NSE"):
+    prompt = f"""You are a senior Indian equity analyst. Analyze this {exchange} corporate filing and give a sharp market impact assessment.
 
 COMPANY: {symbol}
+EXCHANGE: {exchange}
 FILING TYPE: {subject}
 CURRENT PRICE: Rs {price}
 TODAY'S CHANGE: {change_pct}%
@@ -379,12 +518,30 @@ ASSESSMENT RULES:
 - If stock already up more than 5% today — likely priced in, reduce confidence
 - If stock is flat today — genuine surprise, increase confidence
 
-Respond in EXACTLY this format, no extra text:
-SUMMARY: [3 lines max, plain English, what the company actually announced]
-VERDICT: [BULLISH or BEARISH or NEUTRAL]
-CONFIDENCE: [HIGH or MEDIUM or LOW]
-REASON: [One sentence why]
-RISK: [One sentence — what could go wrong or what to watch]"""
+Respond ONLY with valid JSON (no markdown, no backticks). Use this exact structure:
+{{
+  "summary": "3 lines max, plain English, what the company actually announced",
+  "verdict": "BULLISH or BEARISH or NEUTRAL",
+  "confidence_pct": 75,
+  "evidence": [
+    "Specific evidence point 1 from the filing",
+    "Specific evidence point 2 with data/numbers",
+    "Market context point 3"
+  ],
+  "risks": [
+    "Primary risk factor",
+    "Secondary risk to watch"
+  ],
+  "action_window": "IMMEDIATE or TODAY or MONITOR",
+  "reason": "One sentence summary of why this verdict"
+}}
+
+Rules for confidence_pct (0-100):
+- 80-100: Clear catalyst with specific numbers, strong strategic fit
+- 60-79: Good signal but some ambiguity in details
+- 40-59: Mixed signals, could go either way
+- 20-39: Weak signal, mostly noise
+- 0-19: No meaningful market impact"""
 
     for attempt in range(len(GEMINI_KEYS)):
         try:
@@ -401,26 +558,92 @@ RISK: [One sentence — what could go wrong or what to watch]"""
             else:
                 print(f"   Gemini error: {e}")
                 break
-    return f"SUMMARY: {subject}\nVERDICT: NEUTRAL\nCONFIDENCE: LOW\nREASON: Analysis unavailable\nRISK: Review manually"
+    return json.dumps({
+        "summary": subject,
+        "verdict": "NEUTRAL",
+        "confidence_pct": 20,
+        "evidence": ["Analysis unavailable"],
+        "risks": ["Review manually"],
+        "action_window": "MONITOR",
+        "reason": "Analysis unavailable"
+    })
 
 # ============================================================
-# PARSE GEMINI RESPONSE
+# PARSE GEMINI RESPONSE (JSON)
 # ============================================================
 def parse_gemini(text):
     result = {
         "summary": "See filing",
         "verdict": "NEUTRAL",
         "confidence": "LOW",
+        "confidence_pct": 30,
         "reason": "N/A",
-        "risk": "Review manually"
+        "risk": "Review manually",
+        "evidence": "[]",
+        "action_window": "MONITOR",
     }
+
+    # Try JSON parse first
+    try:
+        # Strip markdown code fences if present
+        clean = text.strip()
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+            if clean.endswith("```"):
+                clean = clean[:-3]
+            clean = clean.strip()
+            if clean.startswith("json"):
+                clean = clean[4:].strip()
+
+        data = json.loads(clean)
+        result["summary"] = data.get("summary", result["summary"])
+        result["verdict"] = data.get("verdict", result["verdict"]).upper()
+        result["confidence_pct"] = int(data.get("confidence_pct", 30))
+        result["reason"] = data.get("reason", result["reason"])
+        result["action_window"] = data.get("action_window", "MONITOR")
+
+        # Map confidence_pct to HIGH/MEDIUM/LOW
+        pct = result["confidence_pct"]
+        if pct >= 65:
+            result["confidence"] = "HIGH"
+        elif pct >= 40:
+            result["confidence"] = "MEDIUM"
+        else:
+            result["confidence"] = "LOW"
+
+        # Evidence as JSON string for Supabase storage
+        evidence = data.get("evidence", [])
+        if isinstance(evidence, list):
+            result["evidence"] = json.dumps(evidence)
+        else:
+            result["evidence"] = json.dumps([str(evidence)])
+
+        # Risk — combine risks list into single string
+        risks = data.get("risks", [])
+        if isinstance(risks, list) and risks:
+            result["risk"] = " | ".join(risks)
+        elif isinstance(risks, str):
+            result["risk"] = risks
+
+        return result
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    # Fallback: parse old-style text format
     for line in text.strip().split("\n"):
         if line.startswith("SUMMARY:"):
             result["summary"] = line.replace("SUMMARY:", "").strip()
         elif line.startswith("VERDICT:"):
             result["verdict"] = line.replace("VERDICT:", "").strip().upper()
         elif line.startswith("CONFIDENCE:"):
-            result["confidence"] = line.replace("CONFIDENCE:", "").strip().upper()
+            conf = line.replace("CONFIDENCE:", "").strip().upper()
+            result["confidence"] = conf
+            if conf == "HIGH":
+                result["confidence_pct"] = 75
+            elif conf == "MEDIUM":
+                result["confidence_pct"] = 50
+            else:
+                result["confidence_pct"] = 25
         elif line.startswith("REASON:"):
             result["reason"] = line.replace("REASON:", "").strip()
         elif line.startswith("RISK:"):
@@ -430,7 +653,7 @@ def parse_gemini(text):
 # ============================================================
 # SEND TELEGRAM
 # ============================================================
-def send_telegram(filing, symbol, company, analysis, price, change_pct):
+def send_telegram(filing, symbol, company, analysis, price, change_pct, exchange="NSE"):
     verdict = analysis["verdict"]
     if "BULLISH" in verdict:
         verdict_emoji = "BULLISH \U0001f7e2"
@@ -440,11 +663,23 @@ def send_telegram(filing, symbol, company, analysis, price, change_pct):
         verdict_emoji = "NEUTRAL \U0001f7e1"
 
     conf = analysis["confidence"]
+    conf_pct = analysis.get("confidence_pct", "?")
     conf_emoji = "\u2705" if conf == "HIGH" else "\u26a1" if conf == "MEDIUM" else "\u26a0\ufe0f"
+    action = analysis.get("action_window", "MONITOR")
 
-    message = f"""\U0001f514 NSE FILING ALERT
+    # Parse evidence for display
+    evidence_text = ""
+    try:
+        ev_list = json.loads(analysis.get("evidence", "[]"))
+        if ev_list:
+            evidence_text = "\n".join(f"  \u2022 {e}" for e in ev_list[:4])
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    exchange_icon = "\U0001f1ee\U0001f1f3" if exchange == "NSE" else "\U0001f4b9"
+    message = f"""\U0001f514 {exchange} FILING ALERT
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
-\U0001f3e2 {symbol} | {company}
+{exchange_icon} {symbol} | {company} [{exchange}]
 \U0001f4cb {filing.get('desc', '') or filing.get('subject', 'Corporate Filing')}
 \u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
@@ -453,9 +688,18 @@ def send_telegram(filing, symbol, company, analysis, price, change_pct):
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
 \U0001f4ca MARKET IMPACT
 Verdict: {verdict_emoji}
-Confidence: {conf} {conf_emoji}
+Confidence: {conf} {conf_emoji} ({conf_pct}%)
+Action: {action}
 Reason: {analysis['reason']}
-\u26a0\ufe0f Risk: {analysis['risk']}
+\u26a0\ufe0f Risk: {analysis['risk']}"""
+
+    if evidence_text:
+        message += f"""
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+\U0001f50d EVIDENCE
+{evidence_text}"""
+
+    message += f"""
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
 \U0001f4c8 PRICE AT FILING
 CMP: Rs {price} | Change: {change_pct}%
@@ -467,7 +711,7 @@ CMP: Rs {price} | Change: {change_pct}%
         try:
             resp = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
             if resp.status_code == 200:
-                print(f"   \u2705 Telegram sent to {chat_id}")
+                print(f"   ✅ Telegram sent to {chat_id}")
             else:
                 print(f"   Telegram error for {chat_id}: {resp.text}")
         except Exception as e:
@@ -476,8 +720,8 @@ CMP: Rs {price} | Change: {change_pct}%
 # ============================================================
 # SEND WATCHLIST TELEGRAM ALERT
 # ============================================================
-def send_watchlist_telegram(filing, symbol, company, category, group, price, change_pct):
-    message = f"""\u2b50 WATCHLIST ALERT: {symbol}
+def send_watchlist_telegram(filing, symbol, company, category, group, price, change_pct, exchange="NSE"):
+    message = f"""\u2b50 WATCHLIST ALERT: {symbol} [{exchange}]
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
 \U0001f3e2 {symbol} | {company}
 \U0001f4c1 Watchlist: {group}
@@ -499,7 +743,7 @@ def send_watchlist_telegram(filing, symbol, company, category, group, price, cha
 # ============================================================
 # LOG TO SUPABASE
 # ============================================================
-def log_to_supabase(filing, symbol, company, analysis, price, change_pct, category):
+def log_to_supabase(filing, symbol, company, analysis, price, change_pct, category, exchange="NSE"):
     now = datetime.now()
     row = {
         "date": now.strftime("%Y-%m-%d"),
@@ -516,96 +760,145 @@ def log_to_supabase(filing, symbol, company, analysis, price, change_pct, catego
         "cmp_at_filing": str(price),
         "day_change_pct": f"{float(change_pct):.2f}%" if change_pct != "N/A" else "N/A",
     }
+    # Add new columns if they exist
+    if HAS_EXCHANGE_COL:
+        row["exchange"] = exchange
+    if HAS_CONFIDENCE_PCT_COL:
+        row["confidence_pct"] = analysis.get("confidence_pct")
+    if HAS_EVIDENCE_COL:
+        row["evidence"] = analysis.get("evidence", "[]")
+    if HAS_ACTION_WINDOW_COL:
+        row["action_window"] = analysis.get("action_window", "MONITOR")
+
     try:
         supabase.table("nse_filings").insert(row).execute()
-        print(f"   \u2705 Supabase logged: {symbol} [{category}]")
+        print(f"   ✅ Supabase logged: {symbol} [{exchange}] [{category}]")
     except Exception as e:
         print(f"   Supabase error: {e}")
+        # Retry without new columns if schema error
+        if "does not exist" in str(e):
+            for col in ["exchange", "confidence_pct", "evidence", "action_window"]:
+                row.pop(col, None)
+            try:
+                supabase.table("nse_filings").insert(row).execute()
+                print(f"   ✅ Supabase logged (fallback): {symbol}")
+            except Exception as e2:
+                print(f"   Supabase fallback error: {e2}")
+
+# ============================================================
+# PROCESS A SINGLE FILING
+# ============================================================
+def process_filing(filing, session, seen, exchange="NSE"):
+    """Process a single filing (NSE or BSE). Returns True if new."""
+    symbol = filing.get("symbol", "").upper().strip()
+    if not symbol:
+        return False
+
+    subject = filing.get("desc", "") or filing.get("subject", "")
+    seq = filing.get("seqNo", "")
+    an_dt = filing.get("an_dt", "")
+    filing_id = f"{exchange}_{symbol}_{seq}_{an_dt}"
+
+    if filing_id in seen:
+        return False
+
+    seen.add(filing_id)
+
+    # Step 1: Quick classify
+    category = classify_filing(subject)
+
+    # Step 2: Get live price
+    if exchange == "NSE":
+        nse_sess = get_nse_session()
+        price, change_pct = get_nse_price(nse_sess, symbol)
+    else:
+        bse_sess = get_bse_session()
+        scrip_code = filing.get("_bse_raw", {}).get("SCRIP_CD", "")
+        price, change_pct = get_bse_price(bse_sess, scrip_code) if scrip_code else ("N/A", "N/A")
+
+    # Step 3: Download PDF
+    pdf_path = download_pdf(session, filing, symbol, exchange)
+    company = filing.get("company", "") or filing.get("corp_name", symbol)
+
+    # Step 4: For HIGH/MODERATE — extract PDF text and reclassify
+    pdf_text = ""
+    if category in ("HIGH", "MODERATE") and pdf_path:
+        pdf_text = extract_pdf_text(pdf_path)
+        category = classify_filing(subject, pdf_text)
+
+    # Step 5: Check watchlist
+    watched, watch_group = is_watchlisted(symbol)
+    priority_tag = f" [WATCHLIST: {watch_group}]" if watched else ""
+
+    print(f"\n\U0001f195 [{exchange}] {symbol}: {subject} [{category}]{priority_tag}")
+    print(f"   Rs {price} | {change_pct}%")
+
+    # Step 6: Gemini analysis only for HIGH
+    if category == "HIGH":
+        print(f"   Analyzing with Gemini...")
+        raw = analyze_with_gemini(pdf_text, subject, symbol, price, change_pct, exchange)
+        analysis = parse_gemini(raw)
+        print(f"   Verdict: {analysis['verdict']} | Confidence: {analysis['confidence']} ({analysis['confidence_pct']}%)")
+        send_telegram(filing, symbol, company, analysis, price, change_pct, exchange)
+        track_price(symbol, price)
+    else:
+        analysis = {
+            "summary": "\u2014",
+            "verdict": "N/A",
+            "confidence": "N/A",
+            "confidence_pct": None,
+            "reason": "Routine filing - no analysis needed",
+            "risk": "N/A",
+            "evidence": "[]",
+            "action_window": None,
+        }
+
+    # Step 7: Watchlist alert (triggers for ALL categories)
+    if watched and category != "HIGH":
+        print(f"   Sending watchlist alert for {symbol}...")
+        send_watchlist_telegram(filing, symbol, company, category, watch_group, price, change_pct, exchange)
+
+    # Step 8: Log to Supabase
+    log_to_supabase(filing, symbol, company, analysis, price, change_pct, category, exchange)
+
+    time.sleep(1)
+    return True
 
 # ============================================================
 # MAIN CHECK FUNCTION
 # ============================================================
 def check_filings():
     print(f"\n{'=' * 50}")
-    print(f"\U0001f50d NSE Check at {datetime.now().strftime('%H:%M:%S on %d %b %Y')}")
+    print(f"\U0001f50d NSE + BSE Check at {datetime.now().strftime('%H:%M:%S on %d %b %Y')}")
     print(f"{'=' * 50}")
 
     seen = load_seen()
-    session = get_session()
-    filings = fetch_filings(session)
-
-    filings = [f for f in filings if f is not None]
-
-    if not filings:
-        print("\u26a0\ufe0f  No data from NSE. Resetting session for next cycle.")
-        reset_session()
-        return
-
     new_count = 0
 
-    for filing in filings:
-        symbol = filing.get("symbol", "").upper().strip()
-        subject = filing.get("desc", "") or filing.get("subject", "")
-        seq = filing.get("seqNo", "")
-        an_dt = filing.get("an_dt", "")
-        filing_id = f"{symbol}_{seq}_{an_dt}"
+    # ── Fetch NSE ──
+    nse_sess = get_nse_session()
+    nse_filings = fetch_nse_filings(nse_sess)
+    nse_filings = [f for f in nse_filings if f is not None]
 
-        if filing_id in seen:
-            continue
+    if not nse_filings:
+        print("⚠️  No data from NSE. Resetting session for next cycle.")
+        reset_nse_session()
+    else:
+        for filing in nse_filings:
+            if process_filing(filing, nse_sess, seen, "NSE"):
+                new_count += 1
 
-        new_count += 1
-        seen.add(filing_id)
-
-        # Step 1: Quick classify by subject only
-        category = classify_filing(subject)
-
-        # Step 2: Get live price
-        price, change_pct = get_live_price(session, symbol)
-
-        # Step 3: Download PDF
-        pdf_path = download_pdf(session, filing, symbol)
-        company = filing.get("corp_name", symbol)
-
-        # Step 4: For HIGH/MODERATE — extract PDF text and reclassify
-        pdf_text = ""
-        if category in ("HIGH", "MODERATE") and pdf_path:
-            pdf_text = extract_pdf_text(pdf_path)
-            category = classify_filing(subject, pdf_text)
-
-        # Step 5: Check watchlist
-        watched, watch_group = is_watchlisted(symbol)
-        priority_tag = f" [WATCHLIST: {watch_group}]" if watched else ""
-
-        print(f"\n\U0001f195 {symbol}: {subject} [{category}]{priority_tag}")
-        print(f"   Rs {price} | {change_pct}%")
-
-        # Step 6: Gemini analysis only for HIGH
-        if category == "HIGH":
-            print(f"   Analyzing with Gemini...")
-            raw = analyze_with_gemini(pdf_text, subject, symbol, price, change_pct)
-            analysis = parse_gemini(raw)
-            print(f"   Verdict: {analysis['verdict']} | Confidence: {analysis['confidence']}")
-            send_telegram(filing, symbol, company, analysis, price, change_pct)
-            # Track price for movement alert
-            track_price(symbol, price)
-        else:
-            analysis = {
-                "summary": "\u2014",
-                "verdict": "N/A",
-                "confidence": "N/A",
-                "reason": "Routine filing - no analysis needed",
-                "risk": "N/A"
-            }
-
-        # Step 7: Watchlist alert (triggers for ALL categories)
-        if watched and category != "HIGH":  # HIGH already sent via send_telegram
-            print(f"   Sending watchlist alert for {symbol}...")
-            send_watchlist_telegram(filing, symbol, company, category, watch_group, price, change_pct)
-
-        # Step 8: Log ALL to Supabase
-        log_to_supabase(filing, symbol, company, analysis, price, change_pct, category)
-
-        time.sleep(2)
+    # ── Fetch BSE ──
+    bse_sess = get_bse_session()
+    bse_raw = fetch_bse_filings(bse_sess)
+    if bse_raw:
+        for item in bse_raw:
+            filing = map_bse_filing(item)
+            if process_filing(filing, bse_sess, seen, "BSE"):
+                new_count += 1
+    elif bse_raw is not None:
+        # Empty list is fine (weekends, holidays)
+        pass
 
     save_seen(seen)
 
@@ -613,21 +906,22 @@ def check_filings():
     check_price_movements()
 
     if new_count == 0:
-        print("\u2705 No new filings this cycle.")
+        print("✅ No new filings this cycle.")
     else:
-        print(f"\n\u2705 {new_count} new filing(s) processed.")
+        print(f"\n✅ {new_count} new filing(s) processed.")
 
 # ============================================================
 # STARTUP TELEGRAM MESSAGE
 # ============================================================
 def send_startup_message():
-    message = f"""\U0001f7e2 NSE MONITOR STARTED
+    message = f"""\U0001f7e2 NSE + BSE MONITOR STARTED
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
 \u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}
-\U0001f4e1 Watching: ALL NSE companies
-\U0001f3af High Impact Alerts: Telegram
+\U0001f4e1 Watching: ALL NSE + BSE companies
+\U0001f3af High Impact Alerts: Telegram + AI Analysis
 \U0001f4ca All filings: Supabase
 \u23f1 Interval: Every 30 seconds
+\U0001f916 AI: Gemini 2.0 Flash (structured JSON)
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     chat_ids = load_subscribers()
@@ -641,8 +935,8 @@ def send_startup_message():
 # ENTRY POINT
 # ============================================================
 if __name__ == "__main__":
-    print("\U0001f680 NSE Corporate Filings Monitor")
-    print("   Tracking: ALL NSE companies (equities + SME + debt)")
+    print("\U0001f680 NSE + BSE Corporate Filings Monitor")
+    print("   Tracking: ALL NSE + BSE companies")
     print("   Alerts: HIGH impact \u2192 Telegram | ALL \u2192 Supabase")
     print("   Interval: Every 30 seconds\n")
 
@@ -656,7 +950,7 @@ if __name__ == "__main__":
         try:
             r = requests.post(test_url, json={
                 "chat_id": cid,
-                "text": f"\u2705 Monitor started successfully\n\u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}\n\U0001f4e1 Telegram connection verified"
+                "text": f"\u2705 NSE + BSE Monitor started\n\u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}\n\U0001f4e1 Telegram connection verified"
             }, timeout=10)
             if r.status_code == 200:
                 print(f"   \u2705 Telegram test OK (chat {cid})")
@@ -665,8 +959,9 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"   \u26a0\ufe0f Telegram test FAILED: {e}")
 
-    print("   Initializing NSE session...")
+    print("   Initializing sessions...")
     nse_session = create_nse_session()
+    bse_session = create_bse_session()
     send_startup_message()
     check_filings()
 
@@ -682,7 +977,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\U0001f6d1 Shutdown signal received (Ctrl+C)...")
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        msg = f"\U0001f6d1 NSE Monitor stopped manually.\n\u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}"
+        msg = f"\U0001f6d1 NSE + BSE Monitor stopped manually.\n\u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}"
         for cid in load_subscribers():
             try:
                 resp = requests.post(url, json={"chat_id": cid, "text": msg}, timeout=10)

@@ -4,3 +4,7 @@ openpyxl
 python-dotenv
 supabase
 plotly
+google-genai
+pdfplumber
+requests
+schedule

@@ -4,6 +4,8 @@ credentials.json.json
 subscribers.txt
 .env
 .env.local
+.env.*
+secrets.toml
 
 # Data files (generated at runtime)
 NSE_Filings_Log*.xlsx

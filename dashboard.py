@@ -12,18 +12,22 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", st.secrets.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", st.secrets.get("SUPABASE_KEY", ""))
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ── Gemini for chatbot ──
+GEMINI_KEY = os.environ.get("GEMINI_KEY_1", st.secrets.get("GEMINI_KEY_1", ""))
+
 BASE_DIR = Path(__file__).parent
 WATCHLIST_FILE = BASE_DIR / "watchlist.json"
+FILINGS_FOLDER = BASE_DIR / "Filings"
 
 DISPLAY_COLUMNS = [
-    "Time", "Symbol", "Company", "Filing Type", "Category",
+    "Exchange", "Time", "Symbol", "Company", "Filing Type", "Category",
     "Verdict", "Confidence", "CMP at Filing", "Day Change %",
 ]
 
 HIDE_COLUMNS = ["Reason", "Risk", "Summary", "Date", "PDF Path"]
 
 st.set_page_config(
-    page_title="NSE Corporate Filings Monitor",
+    page_title="NSE + BSE Filings Monitor",
     page_icon="https://www.nseindia.com/favicon.ico",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -153,6 +157,16 @@ st.markdown("""
         display: inline-block;
         animation: blink 1.5s ease-in-out infinite;
     }
+    .exchange-badge {
+        display: inline-block;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 0.65rem;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+    }
+    .exchange-nse { background: rgba(27,79,138,0.12); color: #1B4F8A; }
+    .exchange-bse { background: rgba(220,53,69,0.12); color: #DC3545; }
 
     /* Latest filing bar */
     .latest-bar {
@@ -245,6 +259,67 @@ st.markdown("""
         font-weight: 600;
     }
 
+    /* Confidence progress bar */
+    .conf-bar-outer {
+        background: #E2E8F0;
+        border-radius: 6px;
+        height: 8px;
+        width: 100%;
+        overflow: hidden;
+    }
+    .conf-bar-inner {
+        height: 100%;
+        border-radius: 6px;
+        transition: width 0.3s;
+    }
+    .conf-bar-green { background: #27AE60; }
+    .conf-bar-yellow { background: #F39C12; }
+    .conf-bar-red { background: #E74C3C; }
+
+    /* Evidence bullets */
+    .evidence-box {
+        background: rgba(27,79,138,0.04);
+        border: 1px solid rgba(27,79,138,0.12);
+        border-radius: 6px;
+        padding: 8px 12px;
+        margin: 4px 0 8px 0;
+        font-size: 0.78rem;
+        line-height: 1.5;
+        color: var(--text);
+    }
+    .evidence-box ul { margin: 0; padding-left: 16px; }
+    .evidence-box li { margin-bottom: 2px; }
+
+    /* Chatbot */
+    .chat-msg-user {
+        background: var(--navy);
+        color: white;
+        padding: 10px 14px;
+        border-radius: 12px 12px 4px 12px;
+        margin: 6px 0;
+        font-size: 0.85rem;
+        max-width: 80%;
+        margin-left: auto;
+    }
+    .chat-msg-ai {
+        background: var(--card);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 10px 14px;
+        border-radius: 12px 12px 12px 4px;
+        margin: 6px 0;
+        font-size: 0.85rem;
+        max-width: 90%;
+    }
+    .chat-citation {
+        background: rgba(27,79,138,0.08);
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 0.72rem;
+        font-weight: 600;
+        color: var(--blue);
+    }
+
     /* Dataframe - clean borders */
     .stDataFrame {
         border: 1px solid var(--border);
@@ -320,34 +395,63 @@ def get_market_status():
     return False, "Market Closed"
 
 
-def load_data():
+def load_all_data():
+    """Paginated fetch — gets ALL filings, not just 1000."""
+    all_rows = []
+    page_size = 1000
+    offset = 0
     try:
-        response = supabase.table("nse_filings").select("*").order("created_at", desc=True).limit(5000).execute()
-        if not response.data:
-            return pd.DataFrame()
-        df = pd.DataFrame(response.data)
-        col_map = {
-            "date": "Date",
-            "time": "Time",
-            "symbol": "Symbol",
-            "company": "Company",
-            "filing_type": "Filing Type",
-            "category": "Category",
-            "summary": "Summary",
-            "verdict": "Verdict",
-            "confidence": "Confidence",
-            "reason": "Reason",
-            "risk": "Risk",
-            "cmp_at_filing": "CMP at Filing",
-            "day_change_pct": "Day Change %",
-        }
-        df = df.rename(columns=col_map)
-        if "Category" in df.columns:
-            df["Category"] = df["Category"].astype(str).str.strip().str.upper()
-        return df
+        while True:
+            response = (
+                supabase.table("nse_filings")
+                .select("*")
+                .order("created_at", desc=True)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            if not response.data:
+                break
+            all_rows.extend(response.data)
+            if len(response.data) < page_size:
+                break
+            offset += page_size
     except Exception as e:
         st.error(f"Database connection error: {e}")
         return pd.DataFrame()
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    col_map = {
+        "date": "Date",
+        "time": "Time",
+        "symbol": "Symbol",
+        "company": "Company",
+        "filing_type": "Filing Type",
+        "category": "Category",
+        "summary": "Summary",
+        "verdict": "Verdict",
+        "confidence": "Confidence",
+        "reason": "Reason",
+        "risk": "Risk",
+        "cmp_at_filing": "CMP at Filing",
+        "day_change_pct": "Day Change %",
+        "exchange": "Exchange",
+        "confidence_pct": "Confidence %",
+        "evidence": "Evidence",
+        "action_window": "Action Window",
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+    # Fill exchange default
+    if "Exchange" not in df.columns:
+        df["Exchange"] = "NSE"
+    df["Exchange"] = df["Exchange"].fillna("NSE")
+
+    if "Category" in df.columns:
+        df["Category"] = df["Category"].astype(str).str.strip().str.upper()
+    return df
 
 
 def load_watchlist():
@@ -370,45 +474,11 @@ def style_row(row):
     cat = str(row.get("Category", "")).upper()
     for col in row.index:
         s = ""
-        # Left border on first column based on category
         if col == row.index[0]:
             if cat == "HIGH":
                 s += "border-left: 3px solid #FF6B35; font-weight: 500; "
             elif cat == "MODERATE":
                 s += "border-left: 3px solid #F39C12; "
-        # Category cell coloring
-        if col == "Category":
-            if cat == "HIGH":
-                s += "background-color: rgba(255,107,53,0.12); color: #FF6B35; font-weight: 600; border-radius: 4px; "
-            elif cat == "MODERATE":
-                s += "background-color: rgba(243,156,18,0.12); color: #D4850A; font-weight: 600; border-radius: 4px; "
-            else:
-                s += "background-color: rgba(100,116,139,0.08); color: #64748B; border-radius: 4px; "
-        # Verdict cell coloring
-        if col == "Verdict":
-            v = str(row.get("Verdict", "")).upper()
-            if "BULLISH" in v:
-                s += "background-color: rgba(39,174,96,0.12); color: #27AE60; font-weight: 600; border-radius: 4px; "
-            elif "BEARISH" in v:
-                s += "background-color: rgba(231,76,60,0.12); color: #E74C3C; font-weight: 600; border-radius: 4px; "
-            elif "NEUTRAL" in v:
-                s += "background-color: rgba(100,116,139,0.08); color: #64748B; border-radius: 4px; "
-        styles.append(s)
-    return styles
-
-
-def style_row_watchlist(row):
-    styles = []
-    cat = str(row.get("Category", "")).upper()
-    for col in row.index:
-        s = ""
-        if col == row.index[0]:
-            if cat == "HIGH":
-                s += "border-left: 3px solid #FF6B35; font-weight: 500; "
-            elif cat == "MODERATE":
-                s += "border-left: 3px solid #F39C12; "
-            else:
-                s += "border-left: 3px solid #7C3AED; "
         if col == "Category":
             if cat == "HIGH":
                 s += "background-color: rgba(255,107,53,0.12); color: #FF6B35; font-weight: 600; border-radius: 4px; "
@@ -424,6 +494,12 @@ def style_row_watchlist(row):
                 s += "background-color: rgba(231,76,60,0.12); color: #E74C3C; font-weight: 600; border-radius: 4px; "
             elif "NEUTRAL" in v:
                 s += "background-color: rgba(100,116,139,0.08); color: #64748B; border-radius: 4px; "
+        if col == "Exchange":
+            ex = str(row.get("Exchange", "")).upper()
+            if ex == "BSE":
+                s += "background-color: rgba(220,53,69,0.1); color: #DC3545; font-weight: 600; border-radius: 4px; "
+            else:
+                s += "background-color: rgba(27,79,138,0.1); color: #1B4F8A; font-weight: 600; border-radius: 4px; "
         styles.append(s)
     return styles
 
@@ -437,7 +513,53 @@ def cat_pill(cat):
     return '<span class="cat-pill cat-routine">ROUTINE</span>'
 
 
+def confidence_bar_html(pct):
+    """Generate an HTML confidence progress bar."""
+    if pct is None or pd.isna(pct):
+        return ""
+    try:
+        pct = int(pct)
+    except (ValueError, TypeError):
+        return ""
+    if pct >= 65:
+        color_class = "conf-bar-green"
+    elif pct >= 40:
+        color_class = "conf-bar-yellow"
+    else:
+        color_class = "conf-bar-red"
+    return (
+        f'<div style="display:flex;align-items:center;gap:6px;">'
+        f'<div class="conf-bar-outer" style="flex:1;min-width:60px;">'
+        f'<div class="conf-bar-inner {color_class}" style="width:{pct}%;"></div>'
+        f'</div>'
+        f'<span style="font-size:0.75rem;font-weight:600;color:#1A202C;">{pct}%</span>'
+        f'</div>'
+    )
+
+
+def evidence_html(evidence_str):
+    """Generate HTML for evidence bullets."""
+    if not evidence_str or evidence_str == "[]":
+        return ""
+    try:
+        items = json.loads(evidence_str)
+        if not items:
+            return ""
+        bullets = "".join(f"<li>{item}</li>" for item in items[:4])
+        return f'<div class="evidence-box"><ul>{bullets}</ul></div>'
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+
 # ── Sidebar ──────────────────────────────────────────────────────────────
+st.sidebar.markdown("### Exchange")
+exchange_filter = st.sidebar.radio(
+    "Exchange",
+    ["Both", "NSE", "BSE"],
+    index=0,
+    label_visibility="collapsed",
+)
+
 st.sidebar.markdown("### Filter by Category")
 risk_filter = st.sidebar.radio(
     "Category",
@@ -463,7 +585,7 @@ st.sidebar.markdown(
     f'<p style="color:#94A3B8;font-size:0.72rem;">'
     f'{datetime.now().strftime("%d %b %Y")}<br>'
     f'AI: Gemini 2.0 Flash<br>'
-    f'Source: NSE India</p>',
+    f'Source: NSE + BSE India</p>',
     unsafe_allow_html=True,
 )
 
@@ -477,8 +599,13 @@ st.markdown(f"""
 <div class="header-bar">
     <div class="header-left">
         <div>
-            <div class="header-logo">NSE <span>Filings</span> Monitor</div>
-            <div class="header-subtitle">Real-time Corporate Announcements Intelligence</div>
+            <div class="header-logo">
+                <span class="exchange-badge exchange-nse">NSE</span>
+                +
+                <span class="exchange-badge exchange-bse">BSE</span>
+                &nbsp;<span>Filings</span> Monitor
+            </div>
+            <div class="header-subtitle">Real-time Corporate Announcements Intelligence &mdash; NSE + BSE India</div>
         </div>
     </div>
     <div class="header-right">
@@ -493,7 +620,7 @@ st.markdown(f"""
 # ── Main fragment ────────────────────────────────────────────────────────
 @st.fragment(run_every=30)
 def filings_table():
-    df = load_data()
+    df = load_all_data()
 
     if df.empty:
         st.info("No filings data available. Waiting for the monitor to push data...")
@@ -505,16 +632,27 @@ def filings_table():
     else:
         sorted_df = df
 
+    # ── Apply exchange filter ──
+    if exchange_filter != "Both" and "Exchange" in sorted_df.columns:
+        sorted_df = sorted_df[sorted_df["Exchange"] == exchange_filter].copy()
+
+    if sorted_df.empty:
+        st.info(f"No filings for {exchange_filter} exchange.")
+        return
+
     # ── Latest filing bar ──
     latest = sorted_df.iloc[0]
     ticker_symbol = latest.get("Symbol", "---")
     ticker_type = latest.get("Filing Type", "")
     ticker_cat = latest.get("Category", "")
     ticker_time = latest.get("Time", "")
+    ticker_exchange = latest.get("Exchange", "NSE")
+    ex_badge = f'<span class="exchange-badge exchange-{ticker_exchange.lower()}">{ticker_exchange}</span>'
     st.markdown(
         f'<div class="latest-bar">'
         f'<span class="label">Latest Filing</span>'
         f'<span class="sep">|</span>'
+        f'{ex_badge}'
         f'<strong>{ticker_symbol}</strong>'
         f'<span class="sep">|</span>'
         f'{ticker_type}'
@@ -527,13 +665,13 @@ def filings_table():
     )
 
     # ── Stats ──
-    high_count = len(df[df["Category"] == "HIGH"]) if "Category" in df.columns else 0
-    mod_count = len(df[df["Category"] == "MODERATE"]) if "Category" in df.columns else 0
-    routine_count = len(df[df["Category"] == "ROUTINE"]) if "Category" in df.columns else 0
-    total = len(df)
-    unique_companies = df["Symbol"].nunique() if "Symbol" in df.columns else 0
+    high_count = len(sorted_df[sorted_df["Category"] == "HIGH"]) if "Category" in sorted_df.columns else 0
+    mod_count = len(sorted_df[sorted_df["Category"] == "MODERATE"]) if "Category" in sorted_df.columns else 0
+    routine_count = len(sorted_df[sorted_df["Category"] == "ROUTINE"]) if "Category" in sorted_df.columns else 0
+    total = len(sorted_df)
+    unique_companies = sorted_df["Symbol"].nunique() if "Symbol" in sorted_df.columns else 0
     wl_symbols = get_watchlist_symbols()
-    wl_count = len(df[df["Symbol"].isin(wl_symbols)]) if "Symbol" in df.columns else 0
+    wl_count = len(sorted_df[sorted_df["Symbol"].isin(wl_symbols)]) if "Symbol" in sorted_df.columns else 0
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
@@ -578,7 +716,6 @@ def filings_table():
     chart_data = pd.DataFrame({
         "Category": ["HIGH", "MODERATE", "ROUTINE"],
         "Count": [high_count, mod_count, routine_count],
-        "Color": ["#FF6B35", "#F39C12", "#94A3B8"],
     })
     chart_data = chart_data[chart_data["Count"] > 0]
     if not chart_data.empty:
@@ -599,13 +736,13 @@ def filings_table():
         fig.update_traces(textposition="outside", textfont_size=12)
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    # ── Tabs: All Filings + Watchlist ──
-    tab_all, tab_watchlist = st.tabs(["All Filings", "Watchlist Alerts"])
+    # ── Tabs: All Filings + Watchlist + Chatbot ──
+    tab_all, tab_watchlist, tab_chatbot = st.tabs(["All Filings", "Watchlist Alerts", "Filing Chatbot"])
 
     with tab_all:
         st.markdown('<div class="section-title">Live Filings Feed</div>', unsafe_allow_html=True)
 
-        if risk_filter != "ALL" and "Category" in df.columns:
+        if risk_filter != "ALL" and "Category" in sorted_df.columns:
             filtered = sorted_df[sorted_df["Category"] == risk_filter].copy()
         else:
             filtered = sorted_df.copy()
@@ -629,9 +766,57 @@ def filings_table():
             st.dataframe(styled, use_container_width=True, height=500, hide_index=True)
             st.markdown(
                 f'<p style="color:#94A3B8;font-size:0.72rem;text-align:right;margin-top:4px;">'
-                f'{len(display_df)} records &middot; Filter: {risk_filter} &middot; Refreshes every 30s</p>',
+                f'{len(display_df)} records &middot; Filter: {risk_filter} &middot; Exchange: {exchange_filter} &middot; Refreshes every 30s</p>',
                 unsafe_allow_html=True,
             )
+
+        # ── HIGH filings detail: confidence bar + evidence ──
+        high_df = filtered[filtered["Category"] == "HIGH"] if "Category" in filtered.columns else pd.DataFrame()
+        if not high_df.empty:
+            st.markdown('<div class="section-title">HIGH Impact Analysis Details</div>', unsafe_allow_html=True)
+            for _, row in high_df.head(20).iterrows():
+                symbol = row.get("Symbol", "?")
+                exchange = row.get("Exchange", "NSE")
+                verdict = str(row.get("Verdict", "")).upper()
+                filing_type = row.get("Filing Type", "")
+                file_time = row.get("Time", "")
+                summary = row.get("Summary", "") if "Summary" in row.index else ""
+                conf_pct = row.get("Confidence %") if "Confidence %" in row.index else None
+                evidence_str = row.get("Evidence") if "Evidence" in row.index else None
+
+                # Color for verdict
+                if "BULLISH" in verdict:
+                    v_color = "#27AE60"
+                elif "BEARISH" in verdict:
+                    v_color = "#E74C3C"
+                else:
+                    v_color = "#64748B"
+
+                ex_cls = "exchange-bse" if exchange == "BSE" else "exchange-nse"
+
+                with st.container():
+                    col_head, col_conf = st.columns([3, 1])
+                    with col_head:
+                        st.markdown(
+                            f'<span class="exchange-badge {ex_cls}">{exchange}</span> '
+                            f'<strong>{symbol}</strong> '
+                            f'<span style="color:{v_color};font-weight:600;">{verdict}</span> '
+                            f'<span style="color:#94A3B8;font-size:0.78rem;">| {filing_type} | {file_time}</span>',
+                            unsafe_allow_html=True,
+                        )
+                    with col_conf:
+                        bar_html = confidence_bar_html(conf_pct)
+                        if bar_html:
+                            st.markdown(bar_html, unsafe_allow_html=True)
+
+                    if summary and summary != "\u2014":
+                        st.caption(summary)
+
+                    ev_html = evidence_html(evidence_str)
+                    if ev_html:
+                        st.markdown(ev_html, unsafe_allow_html=True)
+
+                    st.markdown("---")
 
     with tab_watchlist:
         st.markdown('<div class="section-title">Watchlist Filings</div>', unsafe_allow_html=True)
@@ -656,7 +841,7 @@ def filings_table():
 
                 styled_wl = (
                     wl_display.style
-                    .apply(style_row_watchlist, axis=1)
+                    .apply(style_row, axis=1)
                     .set_properties(**{
                         "text-align": "left",
                         "font-size": "0.85rem",
@@ -671,11 +856,123 @@ def filings_table():
                     unsafe_allow_html=True,
                 )
 
+    with tab_chatbot:
+        st.markdown('<div class="section-title">Filing Intelligence Chatbot</div>', unsafe_allow_html=True)
+        st.caption("Ask anything about filings — powered by Gemini AI with full filing context")
+
+        # Initialize chat history
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
+
+        # Show chat history
+        for msg in st.session_state.chat_history:
+            if msg["role"] == "user":
+                st.markdown(f'<div class="chat-msg-user">{msg["content"]}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="chat-msg-ai">{msg["content"]}</div>', unsafe_allow_html=True)
+
+        # Chat input
+        user_question = st.chat_input("Ask about any filing, company, or market signal...")
+
+        if user_question:
+            st.session_state.chat_history.append({"role": "user", "content": user_question})
+            st.markdown(f'<div class="chat-msg-user">{user_question}</div>', unsafe_allow_html=True)
+
+            # Build context from HIGH filings
+            context_parts = []
+            try:
+                high_resp = (
+                    supabase.table("nse_filings")
+                    .select("*")
+                    .eq("category", "HIGH")
+                    .order("created_at", desc=True)
+                    .limit(500)
+                    .execute()
+                )
+                if high_resp.data:
+                    for f in high_resp.data:
+                        exchange = f.get("exchange", "NSE") or "NSE"
+                        evidence = f.get("evidence", "")
+                        entry = (
+                            f"[{exchange} {f.get('symbol','')} filing {f.get('date','')} {f.get('time','')}] "
+                            f"Type: {f.get('filing_type','')} | "
+                            f"Verdict: {f.get('verdict','')} | "
+                            f"Confidence: {f.get('confidence','')} ({f.get('confidence_pct','?')}%) | "
+                            f"Summary: {f.get('summary','')} | "
+                            f"Reason: {f.get('reason','')} | "
+                            f"Risk: {f.get('risk','')}"
+                        )
+                        if evidence and evidence != "[]":
+                            entry += f" | Evidence: {evidence}"
+                        context_parts.append(entry)
+            except Exception as e:
+                context_parts.append(f"[Error loading filings: {e}]")
+
+            # Try loading PDF text from Filings folder
+            pdf_context = ""
+            if FILINGS_FOLDER.exists():
+                try:
+                    pdf_files = list(FILINGS_FOLDER.glob("**/*.pdf"))[:5]  # Latest 5 PDFs
+                    for pf in pdf_files:
+                        try:
+                            import pdfplumber
+                            with pdfplumber.open(pf) as pdf:
+                                for page in pdf.pages[:2]:
+                                    text = page.extract_text()
+                                    if text:
+                                        pdf_context += f"\n[PDF: {pf.stem}]\n{text[:500]}\n"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            context_text = "\n".join(context_parts[:300])  # Limit context size
+
+            # Build Gemini prompt
+            chat_prompt = f"""You are a senior Indian stock market analyst chatbot with access to real-time NSE and BSE corporate filing data.
+
+FILING DATABASE (latest HIGH-impact filings):
+{context_text}
+
+{f"ADDITIONAL PDF CONTEXT:{pdf_context}" if pdf_context else ""}
+
+USER QUESTION: {user_question}
+
+RULES:
+- Answer with specific data from the filings above
+- Always cite sources like [HDFC filing 24 Mar] or [Price data 09:14]
+- If comparing companies, show side-by-side analysis
+- If the question is about sectors, filter relevant filings
+- Be concise but thorough — give actionable insights
+- If data is not available, say so clearly
+- Format your response with clear structure"""
+
+            # Call Gemini
+            answer = ""
+            if GEMINI_KEY:
+                try:
+                    from google import genai as genai_chat
+                    chat_client = genai_chat.Client(api_key=GEMINI_KEY)
+                    response = chat_client.models.generate_content(
+                        model="gemini-2.0-flash-lite",
+                        contents=chat_prompt,
+                    )
+                    answer = response.text
+                except Exception as e:
+                    answer = f"Gemini error: {e}. Please check your API key."
+            else:
+                answer = "Gemini API key not configured. Add GEMINI_KEY_1 to .env or .streamlit/secrets.toml"
+
+            # Format response for HTML display
+            answer_html = answer.replace("\n", "<br>")
+            st.session_state.chat_history.append({"role": "assistant", "content": answer_html})
+            st.markdown(f'<div class="chat-msg-ai">{answer_html}</div>', unsafe_allow_html=True)
+
     # ── Footer ──
     st.markdown(
         f'<div class="footer-text">'
         f'Last refresh: {datetime.now().strftime("%H:%M:%S IST")} &middot; '
-        f'Powered by Supabase &middot; AI by Gemini &middot; Data from NSE India</div>',
+        f'Powered by Supabase &middot; AI by Gemini &middot; Data from NSE + BSE India</div>',
         unsafe_allow_html=True,
     )
 
