@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from supabase import create_client
 
+pd.set_option("styler.render.max_elements", 500000)
+
 # ── Supabase connection ──
 SUPABASE_URL = os.environ.get("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", st.secrets.get("SUPABASE_KEY", ""))
@@ -395,63 +397,61 @@ def get_market_status():
     return False, "Market Closed"
 
 
-def load_all_data():
-    """Paginated fetch — gets ALL filings, not just 1000."""
-    all_rows = []
-    page_size = 1000
-    offset = 0
-    try:
-        while True:
-            response = (
-                supabase.table("nse_filings")
-                .select("*")
-                .order("created_at", desc=True)
-                .range(offset, offset + page_size - 1)
-                .execute()
-            )
-            if not response.data:
-                break
-            all_rows.extend(response.data)
-            if len(response.data) < page_size:
-                break
-            offset += page_size
-    except Exception as e:
-        st.error(f"Database connection error: {e}")
-        return pd.DataFrame()
+_COL_MAP = {
+    "date": "Date", "time": "Time", "symbol": "Symbol", "company": "Company",
+    "filing_type": "Filing Type", "category": "Category", "summary": "Summary",
+    "verdict": "Verdict", "confidence": "Confidence", "reason": "Reason",
+    "risk": "Risk", "cmp_at_filing": "CMP at Filing", "day_change_pct": "Day Change %",
+    "exchange": "Exchange", "confidence_pct": "Confidence %",
+    "evidence": "Evidence", "action_window": "Action Window",
+}
 
-    if not all_rows:
-        return pd.DataFrame()
 
-    df = pd.DataFrame(all_rows)
-    col_map = {
-        "date": "Date",
-        "time": "Time",
-        "symbol": "Symbol",
-        "company": "Company",
-        "filing_type": "Filing Type",
-        "category": "Category",
-        "summary": "Summary",
-        "verdict": "Verdict",
-        "confidence": "Confidence",
-        "reason": "Reason",
-        "risk": "Risk",
-        "cmp_at_filing": "CMP at Filing",
-        "day_change_pct": "Day Change %",
-        "exchange": "Exchange",
-        "confidence_pct": "Confidence %",
-        "evidence": "Evidence",
-        "action_window": "Action Window",
-    }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-
-    # Fill exchange default
+def _apply_schema(df):
+    """Rename columns and fill defaults."""
+    df = df.rename(columns={k: v for k, v in _COL_MAP.items() if k in df.columns})
     if "Exchange" not in df.columns:
         df["Exchange"] = "NSE"
     df["Exchange"] = df["Exchange"].fillna("NSE")
-
     if "Category" in df.columns:
         df["Category"] = df["Category"].astype(str).str.strip().str.upper()
     return df
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_recent_filings():
+    """Fetch 500 most recent filings — single fast query."""
+    try:
+        r = (
+            supabase.table("nse_filings")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(500)
+            .execute()
+        )
+        if not r.data:
+            return pd.DataFrame(), datetime.now().strftime("%H:%M:%S")
+        return _apply_schema(pd.DataFrame(r.data)), datetime.now().strftime("%H:%M:%S")
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return pd.DataFrame(), datetime.now().strftime("%H:%M:%S")
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_counts():
+    """Server-side counts for metric cards — no row data transferred."""
+    counts = {"total": 0, "high": 0, "moderate": 0, "routine": 0}
+    try:
+        r = supabase.table("nse_filings").select("id", count="exact").limit(1).execute()
+        counts["total"] = getattr(r, "count", 0) or 0
+        r = supabase.table("nse_filings").select("id", count="exact").eq("category", "HIGH").limit(1).execute()
+        counts["high"] = getattr(r, "count", 0) or 0
+        r = supabase.table("nse_filings").select("id", count="exact").eq("category", "MODERATE").limit(1).execute()
+        counts["moderate"] = getattr(r, "count", 0) or 0
+        counts["routine"] = max(0, counts["total"] - counts["high"] - counts["moderate"])
+    except Exception:
+        pass
+    return counts
 
 
 def load_watchlist():
@@ -620,7 +620,8 @@ st.markdown(f"""
 # ── Main fragment ────────────────────────────────────────────────────────
 @st.fragment(run_every=30)
 def filings_table():
-    df = load_all_data()
+    df, last_updated = fetch_recent_filings()
+    counts = fetch_counts()
 
     if df.empty:
         st.info("No filings data available. Waiting for the monitor to push data...")
@@ -664,11 +665,11 @@ def filings_table():
         unsafe_allow_html=True,
     )
 
-    # ── Stats ──
-    high_count = len(sorted_df[sorted_df["Category"] == "HIGH"]) if "Category" in sorted_df.columns else 0
-    mod_count = len(sorted_df[sorted_df["Category"] == "MODERATE"]) if "Category" in sorted_df.columns else 0
-    routine_count = len(sorted_df[sorted_df["Category"] == "ROUTINE"]) if "Category" in sorted_df.columns else 0
-    total = len(sorted_df)
+    # ── Stats (server-side counts for totals, local for companies/watchlist) ──
+    total = counts["total"]
+    high_count = counts["high"]
+    mod_count = counts["moderate"]
+    routine_count = counts["routine"]
     unique_companies = sorted_df["Symbol"].nunique() if "Symbol" in sorted_df.columns else 0
     wl_symbols = get_watchlist_symbols()
     wl_count = len(sorted_df[sorted_df["Symbol"].isin(wl_symbols)]) if "Symbol" in sorted_df.columns else 0
@@ -742,10 +743,48 @@ def filings_table():
     with tab_all:
         st.markdown('<div class="section-title">Live Filings Feed</div>', unsafe_allow_html=True)
 
+        # ── Search + Date filter bar ──
+        search_col, date_col = st.columns([3, 1])
+        with search_col:
+            search_query = st.text_input(
+                "Search",
+                placeholder="Search by symbol, company, or filing type...",
+                label_visibility="collapsed",
+            )
+        with date_col:
+            date_range = st.selectbox(
+                "Date range",
+                ["Today", "This Week", "This Month", "All Time"],
+                index=3,
+                label_visibility="collapsed",
+            )
+
+        # ── Apply category filter ──
         if risk_filter != "ALL" and "Category" in sorted_df.columns:
             filtered = sorted_df[sorted_df["Category"] == risk_filter].copy()
         else:
             filtered = sorted_df.copy()
+
+        # ── Apply date filter ──
+        if date_range != "All Time" and "Date" in filtered.columns:
+            today = datetime.now().date()
+            if date_range == "Today":
+                filtered = filtered[filtered["Date"] == today.strftime("%Y-%m-%d")]
+            elif date_range == "This Week":
+                week_start = today - pd.Timedelta(days=today.weekday())
+                filtered = filtered[filtered["Date"] >= week_start.strftime("%Y-%m-%d")]
+            elif date_range == "This Month":
+                month_start = today.replace(day=1)
+                filtered = filtered[filtered["Date"] >= month_start.strftime("%Y-%m-%d")]
+
+        # ── Apply text search ──
+        if search_query and search_query.strip():
+            q = search_query.strip().upper()
+            mask = pd.Series(False, index=filtered.index)
+            for col in ["Symbol", "Company", "Filing Type"]:
+                if col in filtered.columns:
+                    mask = mask | filtered[col].astype(str).str.upper().str.contains(q, na=False)
+            filtered = filtered[mask]
 
         show_cols = [c for c in DISPLAY_COLUMNS if c in filtered.columns]
         display_df = filtered[show_cols].reset_index(drop=True)
@@ -764,59 +803,157 @@ def filings_table():
                 })
             )
             st.dataframe(styled, use_container_width=True, height=500, hide_index=True)
+            if risk_filter == "ALL" and (not search_query or not search_query.strip()) and date_range == "All Time":
+                showing_note = f"Showing {len(display_df)} most recent of {total:,} total"
+            else:
+                showing_note = f"{len(display_df)} matching records"
             st.markdown(
                 f'<p style="color:#94A3B8;font-size:0.72rem;text-align:right;margin-top:4px;">'
-                f'{len(display_df)} records &middot; Filter: {risk_filter} &middot; Exchange: {exchange_filter} &middot; Refreshes every 30s</p>',
+                f'{showing_note} &middot; Updated {last_updated} IST &middot; Refreshes every 30s</p>',
                 unsafe_allow_html=True,
             )
 
         # ── HIGH filings detail: confidence bar + evidence ──
+        # Only show cards for filings with REAL evidence data from Gemini
         high_df = filtered[filtered["Category"] == "HIGH"] if "Category" in filtered.columns else pd.DataFrame()
-        if not high_df.empty:
+        has_conf = "Confidence %" in high_df.columns if not high_df.empty else False
+        has_ev = "Evidence" in high_df.columns if not high_df.empty else False
+        has_aw = "Action Window" in high_df.columns if not high_df.empty else False
+
+        # Build detail_df: only rows with real populated evidence
+        detail_df = pd.DataFrame()
+        if not high_df.empty and has_ev:
+            ev_col = high_df["Evidence"].fillna("")
+            # Must have a JSON array with actual content (not "[]", not empty, not "null")
+            mask = ev_col.str.len() > 4
+            if has_conf:
+                # Also require confidence > 25 to skip "Analysis unavailable" fallbacks
+                mask = mask & high_df["Confidence %"].fillna(0).astype(float).gt(25)
+            detail_df = high_df[mask]
+
+        if not detail_df.empty:
             st.markdown('<div class="section-title">HIGH Impact Analysis Details</div>', unsafe_allow_html=True)
-            for _, row in high_df.head(20).iterrows():
-                symbol = row.get("Symbol", "?")
-                exchange = row.get("Exchange", "NSE")
-                verdict = str(row.get("Verdict", "")).upper()
-                filing_type = row.get("Filing Type", "")
-                file_time = row.get("Time", "")
-                summary = row.get("Summary", "") if "Summary" in row.index else ""
-                conf_pct = row.get("Confidence %") if "Confidence %" in row.index else None
-                evidence_str = row.get("Evidence") if "Evidence" in row.index else None
+            for _, row in detail_df.head(20).iterrows():
+                    symbol = row.get("Symbol", "?")
+                    exch = row.get("Exchange", "NSE")
+                    verdict = str(row.get("Verdict", "")).upper()
+                    filing_type = row.get("Filing Type", "")
+                    file_time = row.get("Time", "")
+                    summary = row.get("Summary", "") if "Summary" in row.index else ""
+                    conf_pct = row.get("Confidence %") if has_conf else None
+                    evidence_str = row.get("Evidence") if has_ev else None
+                    action_window = row.get("Action Window") if has_aw else None
 
-                # Color for verdict
-                if "BULLISH" in verdict:
-                    v_color = "#27AE60"
-                elif "BEARISH" in verdict:
-                    v_color = "#E74C3C"
-                else:
-                    v_color = "#64748B"
+                    # Verdict styling
+                    if "BULLISH" in verdict:
+                        v_color, v_bg = "#27AE60", "rgba(39,174,96,0.1)"
+                    elif "BEARISH" in verdict:
+                        v_color, v_bg = "#E74C3C", "rgba(231,76,60,0.1)"
+                    else:
+                        v_color, v_bg = "#64748B", "rgba(100,116,139,0.08)"
 
-                ex_cls = "exchange-bse" if exchange == "BSE" else "exchange-nse"
+                    ex_cls = "exchange-bse" if exch == "BSE" else "exchange-nse"
 
-                with st.container():
-                    col_head, col_conf = st.columns([3, 1])
-                    with col_head:
-                        st.markdown(
-                            f'<span class="exchange-badge {ex_cls}">{exchange}</span> '
-                            f'<strong>{symbol}</strong> '
-                            f'<span style="color:{v_color};font-weight:600;">{verdict}</span> '
-                            f'<span style="color:#94A3B8;font-size:0.78rem;">| {filing_type} | {file_time}</span>',
-                            unsafe_allow_html=True,
+                    # Confidence bar
+                    conf_html = ""
+                    if conf_pct is not None and not pd.isna(conf_pct):
+                        try:
+                            pct_val = int(conf_pct)
+                            bar_color = "#27AE60" if pct_val >= 65 else "#F39C12" if pct_val >= 40 else "#E74C3C"
+                            conf_html = (
+                                f'<div style="display:flex;align-items:center;gap:8px;margin:6px 0;">'
+                                f'<span style="font-size:0.72rem;color:#64748B;font-weight:600;">CONFIDENCE</span>'
+                                f'<div style="flex:1;max-width:200px;background:#E2E8F0;border-radius:6px;height:10px;overflow:hidden;">'
+                                f'<div style="width:{pct_val}%;height:100%;background:{bar_color};border-radius:6px;"></div>'
+                                f'</div>'
+                                f'<span style="font-size:0.82rem;font-weight:700;color:{bar_color};">{pct_val}%</span>'
+                                f'</div>'
+                            )
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Action window badge
+                    aw_html = ""
+                    if action_window and str(action_window).strip() and str(action_window) != "nan":
+                        aw = str(action_window).strip().upper()
+                        if aw == "IMMEDIATE":
+                            aw_bg, aw_color = "rgba(231,76,60,0.12)", "#E74C3C"
+                        elif aw == "TODAY":
+                            aw_bg, aw_color = "rgba(243,156,18,0.12)", "#D4850A"
+                        else:
+                            aw_bg, aw_color = "rgba(100,116,139,0.08)", "#64748B"
+                        aw_html = (
+                            f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;'
+                            f'background:{aw_bg};color:{aw_color};font-size:0.68rem;font-weight:700;'
+                            f'letter-spacing:0.3px;margin-left:8px;">{aw}</span>'
                         )
-                    with col_conf:
-                        bar_html = confidence_bar_html(conf_pct)
-                        if bar_html:
-                            st.markdown(bar_html, unsafe_allow_html=True)
 
-                    if summary and summary != "\u2014":
-                        st.caption(summary)
+                    # Evidence bullets
+                    ev_bullets = ""
+                    if evidence_str and evidence_str not in ("[]", "", "null"):
+                        try:
+                            items = json.loads(evidence_str)
+                            if items and isinstance(items, list):
+                                icons = [
+                                    "&#x1F4CA;", "&#x1F4CE;", "&#x1F4A1;", "&#x26A1;",
+                                ]
+                                bullet_lines = ""
+                                for i, item in enumerate(items[:4]):
+                                    icon = icons[i % len(icons)]
+                                    bullet_lines += (
+                                        f'<div style="display:flex;gap:6px;align-items:flex-start;margin-bottom:4px;">'
+                                        f'<span style="flex-shrink:0;">{icon}</span>'
+                                        f'<span>{item}</span>'
+                                        f'</div>'
+                                    )
+                                ev_bullets = (
+                                    f'<div style="background:rgba(27,79,138,0.04);border:1px solid rgba(27,79,138,0.12);'
+                                    f'border-radius:6px;padding:10px 14px;margin-top:6px;font-size:0.8rem;line-height:1.6;">'
+                                    f'<div style="font-size:0.68rem;font-weight:700;color:#1B4F8A;text-transform:uppercase;'
+                                    f'letter-spacing:0.5px;margin-bottom:6px;">Evidence</div>'
+                                    f'{bullet_lines}</div>'
+                                )
+                        except (json.JSONDecodeError, TypeError):
+                            pass
 
-                    ev_html = evidence_html(evidence_str)
-                    if ev_html:
-                        st.markdown(ev_html, unsafe_allow_html=True)
+                    # Summary text
+                    summary_html = ""
+                    if summary and summary != "\u2014" and summary != "See filing":
+                        summary_html = f'<div style="font-size:0.8rem;color:#64748B;margin:4px 0 2px 0;">{summary}</div>'
 
-                    st.markdown("---")
+                    # Render full card
+                    card = (
+                        f'<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-left:3px solid {v_color};'
+                        f'border-radius:8px;padding:14px 18px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.04);">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">'
+                        f'<div>'
+                        f'<span class="exchange-badge {ex_cls}">{exch}</span> '
+                        f'<strong style="font-size:1rem;">{symbol}</strong> '
+                        f'<span style="color:{v_color};font-weight:700;background:{v_bg};'
+                        f'padding:2px 8px;border-radius:4px;font-size:0.78rem;">{verdict}</span>'
+                        f'{aw_html}'
+                        f'</div>'
+                        f'<span style="color:#94A3B8;font-size:0.76rem;">{filing_type} &middot; {file_time}</span>'
+                        f'</div>'
+                        f'{summary_html}'
+                        f'{conf_html}'
+                        f'{ev_bullets}'
+                        f'</div>'
+                    )
+                    st.markdown(card, unsafe_allow_html=True)
+        elif not high_df.empty:
+            # HIGH filings exist but none have structured AI analysis yet
+            st.markdown(
+                '<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-radius:8px;'
+                'padding:20px 24px;margin-top:16px;text-align:center;">'
+                '<div style="color:#94A3B8;font-size:0.85rem;">'
+                'AI analysis will appear here for new HIGH filings as they come in.'
+                '</div>'
+                '<div style="color:#CBD5E1;font-size:0.72rem;margin-top:4px;">'
+                'Requires database migration &mdash; run <code>python migrate_db.py</code> for details'
+                '</div></div>',
+                unsafe_allow_html=True,
+            )
 
     with tab_watchlist:
         st.markdown('<div class="section-title">Watchlist Filings</div>', unsafe_allow_html=True)
@@ -971,7 +1108,7 @@ RULES:
     # ── Footer ──
     st.markdown(
         f'<div class="footer-text">'
-        f'Last refresh: {datetime.now().strftime("%H:%M:%S IST")} &middot; '
+        f'Last updated: {last_updated} IST &middot; '
         f'Powered by Supabase &middot; AI by Gemini &middot; Data from NSE + BSE India</div>',
         unsafe_allow_html=True,
     )
