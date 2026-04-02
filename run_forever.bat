@@ -1,6 +1,13 @@
 @echo off
 cd "C:\Users\LENOVO\Desktop\linkdin projects"
 
+echo ============================================
+echo Launching Telegram Bot in separate window...
+echo ============================================
+start "Telegram Bot" /min run_bot_forever.bat
+
+timeout /t 3
+
 :loop
 echo ============================================
 echo Starting NSE Monitor...

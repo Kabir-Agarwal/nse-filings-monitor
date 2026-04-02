@@ -220,7 +220,7 @@ def send_price_alert(symbol, baseline, current, pct_change):
 \u26a1 Post-filing price action detected"""
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    chat_ids = load_subscribers()
+    chat_ids = get_matching_subscribers("HIGH", symbol, "price alert")
     for chat_id in chat_ids:
         try:
             requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
@@ -231,12 +231,67 @@ def send_price_alert(symbol, baseline, current, pct_change):
 # TELEGRAM SUBSCRIBERS
 # ============================================================
 def load_subscribers():
+    """Load fallback subscribers from local file."""
     if not os.path.exists(SUBSCRIBERS_FILE):
         with open(SUBSCRIBERS_FILE, "w") as f:
             f.write("1281388903\n")
     with open(SUBSCRIBERS_FILE, "r") as f:
         ids = [line.strip() for line in f.readlines() if line.strip()]
     return ids
+
+
+def get_all_active_subscribers():
+    """Return chat_ids for all active Supabase subscribers. Falls back to file."""
+    try:
+        r = supabase.table("subscribers").select("chat_id").eq("is_active", True).execute()
+        if r.data:
+            return [row["chat_id"] for row in r.data]
+    except Exception as e:
+        print(f"   Subscriber fetch error: {e}")
+    return load_subscribers()
+
+
+def get_matching_subscribers(category: str, symbol: str, filing_type: str):
+    """
+    Return chat_ids of active subscribers whose preferences match this filing.
+    Matching rules:
+      - category must be in subscriber's categories list
+      - if subscriber watchlist is non-empty, symbol must be in it
+      - if subscriber filing_types is non-empty, filing_type must contain one of them
+    Falls back to subscribers.txt if Supabase table is empty or unreachable.
+    """
+    try:
+        r = supabase.table("subscribers").select("*").eq("is_active", True).execute()
+        if not r.data:
+            return load_subscribers()
+
+        symbol_up = symbol.upper()
+        ft_lower = filing_type.lower()
+        matching = []
+        for sub in r.data:
+            # Category filter
+            sub_cats = sub.get("categories") or ["HIGH"]
+            if category not in sub_cats and "ALL" not in sub_cats:
+                continue
+
+            # Watchlist filter (empty = all symbols)
+            watchlist = [s.upper() for s in (sub.get("watchlist") or [])]
+            if watchlist and symbol_up not in watchlist:
+                continue
+
+            # Filing type filter (empty = all types)
+            sub_fts = [ft.lower() for ft in (sub.get("filing_types") or [])]
+            if sub_fts and not any(ft in ft_lower for ft in sub_fts):
+                continue
+
+            matching.append(sub["chat_id"])
+
+        # If no personalized subscribers match, fall back to file so alerts are never silent
+        return matching if matching else load_subscribers()
+
+    except Exception as e:
+        print(f"   Subscriber query error: {e}")
+        return load_subscribers()
 
 # ============================================================
 # NSE SESSION
@@ -705,8 +760,9 @@ Reason: {analysis['reason']}
 CMP: Rs {price} | Change: {change_pct}%
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"""
 
+    filing_type = filing.get("desc", "") or filing.get("subject", "Corporate Filing")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    chat_ids = load_subscribers()
+    chat_ids = get_matching_subscribers("HIGH", symbol, filing_type)
     for chat_id in chat_ids:
         try:
             resp = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
@@ -716,6 +772,29 @@ CMP: Rs {price} | Change: {change_pct}%
                 print(f"   Telegram error for {chat_id}: {resp.text}")
         except Exception as e:
             print(f"   Telegram exception for {chat_id}: {e}")
+
+# ============================================================
+# SEND MODERATE TELEGRAM ALERT
+# ============================================================
+def send_moderate_alert(filing, symbol, company, price, change_pct, exchange, chat_ids):
+    """Send a basic filing alert to subscribers who want MODERATE category."""
+    subject = filing.get("desc", "") or filing.get("subject", "Corporate Filing")
+    exchange_icon = "\U0001f1ee\U0001f1f3" if exchange == "NSE" else "\U0001f4b9"
+    message = f"""\u26a1 {exchange} MODERATE FILING: {symbol}
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+{exchange_icon} {symbol} | {company} [{exchange}]
+\U0001f4cb {subject}
+\u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+\U0001f4c8 CMP: Rs {price} | Change: {change_pct}%
+\U0001f3f7 Category: MODERATE"""
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for chat_id in chat_ids:
+        try:
+            requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
+        except Exception as e:
+            print(f"   Moderate alert error for {chat_id}: {e}")
 
 # ============================================================
 # SEND WATCHLIST TELEGRAM ALERT
@@ -732,8 +811,9 @@ def send_watchlist_telegram(filing, symbol, company, category, group, price, cha
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
 \u26a1 Your watchlisted stock filed a corporate announcement"""
 
+    filing_type = filing.get("desc", "") or filing.get("subject", "Corporate Filing")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    chat_ids = load_subscribers()
+    chat_ids = get_matching_subscribers(category, symbol, filing_type)
     for chat_id in chat_ids:
         try:
             requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
@@ -853,6 +933,13 @@ def process_filing(filing, session, seen, exchange="NSE"):
             "action_window": None,
         }
 
+    # Step 6.5: MODERATE alert for subscribers who opted in for MODERATE
+    if category == "MODERATE":
+        mod_subs = get_matching_subscribers("MODERATE", symbol, subject)
+        if mod_subs:
+            print(f"   Sending MODERATE alert to {len(mod_subs)} subscriber(s)...")
+            send_moderate_alert(filing, symbol, company, price, change_pct, exchange, mod_subs)
+
     # Step 7: Watchlist alert (triggers for ALL categories)
     if watched and category != "HIGH":
         print(f"   Sending watchlist alert for {symbol}...")
@@ -924,7 +1011,7 @@ def send_startup_message():
 \U0001f916 AI: Gemini 2.0 Flash (structured JSON)
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    chat_ids = load_subscribers()
+    chat_ids = get_all_active_subscribers()
     for chat_id in chat_ids:
         try:
             requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
@@ -945,7 +1032,7 @@ if __name__ == "__main__":
     # Verify Telegram connectivity before starting
     print("   Testing Telegram connection...")
     test_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    test_ids = load_subscribers()
+    test_ids = get_all_active_subscribers()
     for cid in test_ids:
         try:
             r = requests.post(test_url, json={
@@ -978,7 +1065,7 @@ if __name__ == "__main__":
         print("\n\U0001f6d1 Shutdown signal received (Ctrl+C)...")
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         msg = f"\U0001f6d1 NSE + BSE Monitor stopped manually.\n\u23f0 {datetime.now().strftime('%H:%M IST | %d %b %Y')}"
-        for cid in load_subscribers():
+        for cid in get_all_active_subscribers():
             try:
                 resp = requests.post(url, json={"chat_id": cid, "text": msg}, timeout=10)
                 if resp.status_code == 200:

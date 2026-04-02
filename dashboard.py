@@ -238,6 +238,7 @@ st.markdown("""
     .val-rout  { color: var(--text-muted); }
     .val-comp  { color: var(--blue); }
     .val-wl    { color: #7C3AED; }
+    .val-sub   { color: #0891B2; }
 
     /* Section headers */
     .section-title {
@@ -440,7 +441,7 @@ def fetch_recent_filings():
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_counts():
     """Server-side counts for metric cards — no row data transferred."""
-    counts = {"total": 0, "high": 0, "moderate": 0, "routine": 0}
+    counts = {"total": 0, "high": 0, "moderate": 0, "routine": 0, "subscribers": 0}
     try:
         r = supabase.table("nse_filings").select("id", count="exact").limit(1).execute()
         counts["total"] = getattr(r, "count", 0) or 0
@@ -451,6 +452,11 @@ def fetch_counts():
         counts["routine"] = max(0, counts["total"] - counts["high"] - counts["moderate"])
     except Exception:
         pass
+    try:
+        r = supabase.table("subscribers").select("id", count="exact").eq("is_active", True).limit(1).execute()
+        counts["subscribers"] = getattr(r, "count", 0) or 0
+    except Exception:
+        counts["subscribers"] = 0
     return counts
 
 
@@ -674,7 +680,8 @@ def filings_table():
     wl_symbols = get_watchlist_symbols()
     wl_count = len(sorted_df[sorted_df["Symbol"].isin(wl_symbols)]) if "Symbol" in sorted_df.columns else 0
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    sub_count = counts.get("subscribers", 0)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     with c1:
         st.markdown(
             f'<div class="metric-card">'
@@ -710,6 +717,12 @@ def filings_table():
             f'<div class="metric-card">'
             f'<div class="metric-value val-wl">{wl_count}</div>'
             f'<div class="metric-label">Watchlist Hits</div></div>',
+            unsafe_allow_html=True)
+    with c7:
+        st.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-value val-sub">{sub_count}</div>'
+            f'<div class="metric-label">Subscribers</div></div>',
             unsafe_allow_html=True)
 
     # ── Category breakdown chart ──

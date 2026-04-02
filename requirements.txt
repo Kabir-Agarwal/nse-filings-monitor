@@ -8,3 +8,4 @@ google-genai
 pdfplumber
 requests
 schedule
+python-telegram-bot>=20.0
