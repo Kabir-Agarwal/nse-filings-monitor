@@ -1,97 +1,199 @@
-# NSE Corporate Filings Monitor
+# NSE + BSE Corporate Filings Monitor
 
 ## Project Purpose
-Real-time NSE (National Stock Exchange of India) corporate filings monitor that:
-- Fetches ALL corporate announcements from NSE every 30 seconds
+Real-time NSE + BSE corporate filings monitor that:
+- Fetches ALL corporate announcements from NSE + BSE every 30 seconds
 - Classifies them as HIGH / MODERATE / ROUTINE impact
-- Runs Gemini AI analysis on HIGH impact filings
-- Sends Telegram alerts for HIGH impact filings
-- Logs everything to a color-coded Excel file
-- Displays a live Streamlit dashboard for monitoring
+- Runs Gemini AI analysis on HIGH impact filings (verdict, confidence score, evidence, action window)
+- Sends personalized Telegram alerts to multiple subscribers based on their preferences
+- Logs everything to Supabase (primary) and a color-coded Excel file
+- Displays a live Streamlit dashboard (Screener/Moneycontrol-style professional UI)
+- Tracks post-filing price movements for HIGH filings (alerts if stock moves >2% within 10 min)
 
-## System Status
-- **Monitor**: Running (confirmed PID 20156)
-- **Auto-restart**: run_forever.bat logs crashes to `crashes.log` with timestamps and exit codes
-- **Windows Startup**: Shortcut created at `Startup/NSE_Monitor.lnk` — auto-launches on reboot (minimized)
-- **All systems operational**
+## Architecture
+```
+nse_monitor.py      ← Continuous monitor (NSE + BSE feeds, Gemini, Supabase, Telegram)
+dashboard.py        ← Streamlit dashboard (reads from Supabase)
+telegram_bot.py     ← Multi-subscriber Telegram bot (polling, manages subscribers table)
+migrate_db.py       ← One-time DB schema migration (adds columns, creates subscribers table)
+run_forever.bat     ← Auto-restart wrapper for nse_monitor.py
+run_bot_forever.bat ← Auto-restart wrapper for telegram_bot.py
+```
 
 ## Files
 
-### Core
-- **nse_monitor.py** — Main monitor script (runs continuously)
-  - Fetches filings from 3 NSE APIs in parallel (equities, SME, debt)
-  - Keyword-based classification (HIGH/MODERATE/ROUTINE)
+### Core Scripts
+- **nse_monitor.py** — Main monitor (runs continuously)
+  - Fetches from 3 NSE APIs in parallel (equities, SME, debt) + BSE API
+  - Session-based with cookie warmup for both NSE and BSE
+  - Keyword-based classification (HIGH / MODERATE / ROUTINE)
   - Downloads filing PDFs to `Filings/<SYMBOL>/` folders
-  - Gemini 2.0 Flash Lite analysis for HIGH filings (3 API keys with rotation)
-  - Telegram alerts for HIGH filings
-  - Atomic Excel writes: saves to `_temp.xlsx`, backs up to `_backup.xlsx`, then replaces main file
-  - Runs on 30-second schedule via `schedule` library
+  - Gemini 2.0 Flash Lite analysis for HIGH filings: verdict, confidence %, evidence, action window
+  - 3 Gemini API keys with auto-rotation on 429 rate limits
+  - Writes to Supabase `nse_filings` table (primary store)
+  - Writes to Excel `NSE_Filings_Log.xlsx` (atomic: temp → backup → replace)
+  - Sends Telegram alerts to all active subscribers (filtered by their preferences)
+  - Price movement tracker: stores CMP at filing time, checks 10 min later, alerts if >2% move
+  - Schema detection at startup: checks optional columns (exchange, confidence_pct, evidence, action_window)
+  - `seen_filings.json` deduplication (format: `NSE_SYMBOL_seqNo_date` / `BSE_SYMBOL_seqNo_date`)
 
-- **dashboard.py** — Streamlit dashboard (dark Bloomberg-style terminal UI)
+- **dashboard.py** — Streamlit dashboard (professional financial UI)
+  - Reads live data from Supabase
   - Auto-refreshes every 30s via `@st.fragment(run_every=30)`
-  - Dark theme with custom CSS, monospace fonts, terminal aesthetic
-  - Live ticker bar showing most recent filing
-  - Pulsing green "SYSTEM LIVE" indicator
-  - Color-coded rows: GREEN (#00B050) for HIGH, YELLOW (#FFD700) for MODERATE
+  - Professional Inter-font Screener/Moneycontrol-style CSS (navy, orange, green theme)
+  - Supports `.streamlit/secrets.toml` or `.env` for credentials
+  - Display columns: Exchange, Time, Symbol, Company, Filing Type, Category, Verdict, Confidence, CMP at Filing, Day Change %
+  - Hidden columns: Reason, Risk, Summary, Date, PDF Path
   - Stats badges, sidebar filters, market open/closed indicator
-  - Category breakdown bar chart
-  - Reads Excel via temp file copy; falls back to `_backup.xlsx` on BadZipFile
-  - Display columns: Time, Symbol, Company, Filing Type, Category, Verdict, Confidence, CMP at Filing, Day Change %
-  - Hidden columns: Date, Summary, Reason, Risk, PDF Path
+  - Category breakdown bar chart (Plotly)
+  - Watchlist group tagging (reads `watchlist.json`)
+  - Live ticker bar showing most recent filing
 
-- **run_forever.bat** — Auto-restart wrapper with crash logging
-  - Restarts nse_monitor.py after 10s on crash
-  - Logs start/stop times, exit codes, and crash reasons to `crashes.log`
-  - Windows Startup shortcut ensures auto-launch on reboot
+- **telegram_bot.py** — Multi-subscriber personalized Telegram bot
+  - Reads credentials from `.env` (TELEGRAM_TOKEN, SUPABASE_URL, SUPABASE_KEY)
+  - Commands: `/start`, `/subscribe`, `/watchlist`, `/settings`, `/pause`, `/resume`, `/stop`, `/help`
+  - 3-step subscription wizard (categories → symbols → filing types)
+  - Per-subscriber preferences stored in Supabase `subscribers` table:
+    - `categories`: list (HIGH / MODERATE / ROUTINE / ALL)
+    - `watchlist`: list of NSE/BSE symbols (empty = all companies)
+    - `filing_types`: list of filing type filters (empty = all types)
+    - `is_active`: bool (pause/resume without losing settings)
+  - Inline keyboard menus for all actions
+  - Full unsubscribe deletes row from DB
 
-### Data Files
-- **NSE_Filings_Log.xlsx** — Main Excel log (13 columns: Date, Time, Symbol, Company, Filing Type, Category, Summary, Verdict, Confidence, Reason, Risk, CMP at Filing, Day Change %)
-- **NSE_Filings_Log_backup.xlsx** — Auto-backup created before each write
-- **crashes.log** — Monitor crash/restart history with timestamps
-- **seen_filings.json** — Tracks processed filing IDs to avoid duplicates (format: `SYMBOL_seqNo_date`)
-- **subscribers.txt** — Telegram chat IDs for alerts (currently: 1281388903)
-- **credentials.json** — Google API credentials
+- **migrate_db.py** — One-time Supabase schema migration
+  - Checks nse_filings for 4 optional columns: exchange, confidence_pct, evidence, action_window
+  - Checks/creates `subscribers` table
+  - Auto-migrates via Supabase Management API if `SUPABASE_PAT` is in `.env`
+  - Prints SQL to run manually if PAT not available
+  - **Run once**: `python migrate_db.py` — confirmed all schema items exist
+
+- **run_forever.bat** — Auto-restart wrapper for nse_monitor.py
+  - Restarts after 10s on crash
+  - Logs start/stop times, exit codes to `crashes.log`
+  - Windows Startup shortcut at `Startup/NSE_Monitor.lnk`
+
+- **run_bot_forever.bat** — Auto-restart wrapper for telegram_bot.py
+  - Same pattern as run_forever.bat
+
+### Config Files
+- **.env** — All credentials (never committed, see `.env.example`)
+  ```
+  GEMINI_KEY_1=...
+  GEMINI_KEY_2=...
+  GEMINI_KEY_3=...
+  TELEGRAM_TOKEN=...
+  SUPABASE_URL=https://xxx.supabase.co
+  SUPABASE_KEY=...
+  SUPABASE_PAT=sbp_xxxx   # optional, for migrate_db.py auto-migration
+  ```
+- **.env.example** — Template for .env (committed)
+- **watchlist.json** — Symbol groups for dashboard tagging `{"GROUP": ["SYMBOL1", ...]}`
+- **requirements.txt** — Python deps
+
+### Data Files (not committed)
+- **NSE_Filings_Log.xlsx** — Excel log (Date, Time, Symbol, Company, Filing Type, Category, Summary, Verdict, Confidence, Reason, Risk, CMP at Filing, Day Change %)
+- **NSE_Filings_Log_backup.xlsx** — Auto-backup before each write
+- **crashes.log** — Monitor crash/restart history
+- **seen_filings.json** — Processed filing IDs (dedup cache)
 
 ### Folders
-- **Filings/** — Downloaded PDF filings organized by symbol subfolder
+- **Filings/** — Downloaded PDFs organized by symbol
+
+## Supabase Schema
+
+### `nse_filings` table
+| Column | Type | Notes |
+|---|---|---|
+| id | bigserial PK | |
+| created_at | timestamp | |
+| date | text | |
+| time | text | |
+| symbol | text | |
+| company | text | |
+| filing_type | text | |
+| category | text | HIGH/MODERATE/ROUTINE |
+| summary | text | Gemini summary |
+| verdict | text | Gemini verdict |
+| confidence | text | e.g. "85%" |
+| reason | text | Gemini reasoning |
+| risk | text | Gemini risk |
+| cmp_at_filing | text | Live price at time of filing |
+| day_change_pct | text | Day % change at filing |
+| exchange | text | NSE or BSE |
+| confidence_pct | integer | Numeric confidence score |
+| evidence | text | Gemini evidence bullets |
+| action_window | text | Gemini suggested action window |
+
+### `subscribers` table
+| Column | Type | Notes |
+|---|---|---|
+| id | bigserial PK | |
+| chat_id | text UNIQUE | Telegram chat ID |
+| username | text | Telegram @username |
+| first_name | text | Telegram first name |
+| watchlist | text[] | NSE/BSE symbols filter (empty = all) |
+| filing_types | text[] | Filing type filter (empty = all) |
+| categories | text[] | DEFAULT {"HIGH"} |
+| is_active | boolean | DEFAULT true |
+| created_at | timestamp | |
+| updated_at | timestamp | |
 
 ## External Services
-- **Gemini AI** — 3 API keys with auto-rotation on 429 rate limits, model: `gemini-2.0-flash-lite`
-- **Telegram Bot** — Token in nse_monitor.py, sends formatted alerts with verdict/confidence/price
-- **NSE APIs** — Session-based with cookie warmup (hits nseindia.com first, then API endpoints)
+- **Gemini AI** — 3 API keys with auto-rotation on 429, model: `gemini-2.0-flash-lite`
+- **Telegram Bot** — python-telegram-bot>=20.0, polling mode
+- **Supabase** — PostgreSQL DB for filings + subscribers
+- **NSE APIs** — Session-based (equities, SME, debt endpoints)
+- **BSE API** — Session-based
 
 ## How to Run
-```bash
-# Monitor (keeps running, auto-restarts on crash)
-run_forever.bat
+```powershell
+# From project directory (where .env lives):
+
+# Monitor + auto-restart
+.\run_forever.bat
 
 # Or directly
 python nse_monitor.py
 
+# Telegram bot + auto-restart
+.\run_bot_forever.bat
+
+# Or directly
+python telegram_bot.py
+
 # Dashboard (separate terminal)
 streamlit run dashboard.py
+
+# DB migration (run once)
+python migrate_db.py
 ```
 
-## Excel Structure
-Row colors applied via openpyxl:
-- HIGH: Green fill (#00B050)
-- MODERATE: Yellow fill (#FFFF00)
-- ROUTINE: No fill
-
-Headers styled with dark blue (#1F4E79) background, white bold font.
-
 ## Classification Keywords
-- **HIGH**: acquisition, merger, demerger, scheme, fund raising, joint venture, new order, product launch, partnership, order win, buyback, delisting, etc.
-- **MODERATE**: board meeting, results, press release, credit rating, appointment, resignation, investor presentation, allotment, etc.
+- **HIGH**: acquisition, merger, demerger, amalgamation, scheme, fund raising, joint venture, new order/project, product launch, partnership, order win, agreement, MOU, LOI, buyback, delisting, strategic, wins, awarded, secures, bags, expands, commencement, commercial production, etc.
+- **MODERATE**: board meeting, results, financial results, press release, credit rating, appointment, resignation, insider trading, bulk/block deal, investor presentation, analysts meet, trading window, allotment, etc.
 - **ROUTINE**: Everything else
 
 ## Known Behaviors
-- NSE sessions expire periodically — session resets automatically when no data is returned
-- Excel file can get locked if opened in Excel desktop app — monitor retries 3 times with 2s delay
-- The `~$NSE_Filings_Log.xlsx` lock file indicates Excel has the file open
-- Atomic write pattern (temp -> backup -> replace) prevents corruption from simultaneous dashboard reads
+- NSE/BSE sessions expire periodically — reset automatically when no data returned
+- Excel can get locked if open in Excel desktop — monitor retries 3× with 2s delay
+- `~$NSE_Filings_Log.xlsx` lock file = Excel has the file open
+- Atomic write: temp → backup → replace prevents dashboard read corruption
+- `seen_filings.json` uses exchange-prefixed IDs (`NSE_SYMBOL_seqNo_date`) to dedup across exchanges
+- Schema detection at startup warns if optional columns are missing (`python migrate_db.py` to fix)
+- `subscribers.txt` (legacy flat file) is no longer used — Supabase `subscribers` table is authoritative
 
 ## Dependencies
 ```
-requests, schedule, openpyxl, pdfplumber, google-genai, streamlit, pyngrok
+streamlit>=1.55
+pandas
+openpyxl
+python-dotenv
+supabase
+plotly
+google-genai
+pdfplumber
+requests
+schedule
+python-telegram-bot>=20.0
 ```
